@@ -1,0 +1,17 @@
+__pycache__/
+.DS_Store
+.venv/
+.venv*/
+data/
+.dist/
+data/workflow.db
+data/studies/
+data/models/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+*.pyc
+admin-password.txt
+demo-cases/*/archive-index.json
+demo-cases/*/source-*.nii.gz
