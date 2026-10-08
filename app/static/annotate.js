@@ -177,13 +177,11 @@ async function openCase(id) {
     if (head) state.undo = [head.parent_id];
     $("viewer-empty").hidden = true;
     history.replaceState({}, "", `/viewer?study_id=${id}${embedded ? '&embedded=1' : ''}`);
-    state.runningJobId = state.jobs.find((job) => ['queued', 'running'].includes(job.status))?.id || null;
-    if (state.runningJobId) schedulePoll();
+    state.runningJobId = null;
   } catch (error) {
     $("viewer-empty").querySelector("h2").textContent = "Unable to open this CT";
     state.volume = null; throw error;
   } finally { state.loading = false; updateControls(); renderHistory(); requestRender(); }
-  if (proposalIsCurrent(state.job, state.meta, state.selectedNodule) && !state.meta?.confirmation) await showProposal();
 }
 
 async function loadMask() {
@@ -196,8 +194,6 @@ async function loadMask() {
 async function reloadDraft() {
   state.meta = await json(base());
   state.jobs = state.meta.jobs;
-  const running = state.jobs.find((job) => ['queued', 'running'].includes(job.status));
-  if (running && state.runningJobId !== running.id) {state.runningJobId = running.id; schedulePoll();}
   await loadMask(); reconcileNodules(); syncCaseStatus(); renderHistory(); updateControls(); requestRender();
 }
 function syncCaseStatus() {
@@ -271,7 +267,7 @@ function renderNodules() {
 async function addNodule() {
   if ($("add-nodule").disabled) return;
   const result = await mutate(`${base()}/nodules`, {});
-  if (result) {selectNodule(result.nodule_label, false); setTool(state.model?.available ? 'box' : 'brush'); notify(`N${result.nodule_label} added. Draw a box or paint its mask; other nodules are preserved.`);}
+  if (result) {selectNodule(result.nodule_label, false); setTool('brush'); notify(`N${result.nodule_label} added. Paint its mask; other lesions are preserved.`);}
 }
 $("add-nodule").addEventListener('click', task(addNodule));
 $("nodule-select").addEventListener('change', task(async () => {
@@ -428,7 +424,7 @@ function setTool(tool) {
   state.tool = tool; state.brushHover = null;
   document.querySelectorAll("[data-tool]").forEach((el) => {el.classList.toggle("active", el.dataset.tool === tool); el.setAttribute("aria-pressed", el.dataset.tool === tool);});
   views.forEach((view) => view.canvas.style.cursor = tool === "pan" ? "grab" : tool === "zoom" ? "zoom-in" : "crosshair");
-  $("interaction-hint").textContent = {box: "Box one lesion in any plane. Set the slice range in the inspector.", brush: "Paint: add voxels | Pinch: zoom | Cmd/Ctrl+Z: undo", erase: "Paint: remove voxels | Pinch: zoom | Cmd/Ctrl+Z: undo", pan: "Drag: pan | Pinch: zoom | Double-click: focus/restore", zoom: "Drag up/down or scroll: zoom | +/-: zoom selected view | Fit: reset", crosshair: "Double-click: focus/restore | Pinch: zoom | Scroll: slice | Cmd/Ctrl+Z: undo"}[tool];
+  $("interaction-hint").textContent = {brush: "Paint: add voxels | Pinch: zoom | Cmd/Ctrl+Z: undo", erase: "Paint: remove voxels | Pinch: zoom | Cmd/Ctrl+Z: undo", pan: "Drag: pan | Pinch: zoom | Double-click: focus/restore", zoom: "Drag up/down or scroll: zoom | +/-: zoom selected view | Fit: reset", crosshair: "Double-click: focus/restore | Pinch: zoom | Scroll: slice | Cmd/Ctrl+Z: undo"}[tool];
   updateControls(); requestRender();
 }
 function isEditTool() {return ["brush", "erase"].includes(state.tool);}
@@ -607,7 +603,7 @@ $("workflow-undo").addEventListener("click", task(requestUndo));
 
 function updateControls() {
   const ready = !!state.volume && !state.busy && !state.loading && !pendingPoint && !pointSave && !views.some((v) => v.drag);
-  const flow = workflow(), {running, confirmed} = flow;
+  const flow = workflow(), {confirmed} = flow;
   const readOnly = state.meta?.permissions?.annotate === false && !confirmed;
   const nodule = activeNodule();
   $("add-nodule").disabled = !ready || confirmed || readOnly || !state.meta?.can_add_nodule;
@@ -619,23 +615,6 @@ function updateControls() {
   for (const button of document.querySelectorAll("[data-delete-mask]")) button.disabled = !ready || confirmed || readOnly || state.preview || !nodule;
   $("delete-nodule").textContent = nodule ? `Delete ${nodule.id}` : 'Delete nodule mask';
   $("delete-mask-note").textContent = confirmed ? "Reopen the case before deleting a nodule." : state.preview ? "Return to the saved mask before deleting it." : "Deletes only the selected nodule. Others are preserved. Undo restores it.";
-  const validBox = validPrompt();
-  $("run-model").disabled = !ready || !state.model?.available || !(state.model?.modalities || ['CT']).includes(state.meta?.modality) || running || !validBox || confirmed || readOnly || !nodule;
-  $('model-slice-radius').disabled = running || confirmed || readOnly;
-  if (state.model?.id === 'litemedsam-onnx') {
-    const radius = Number($('model-slice-radius').value);
-    const normal = axes(state.box?.plane || state.activePlane)[2];
-    const frame = state.box?.frame_index ?? state.cross[normal];
-    const last = (state.meta?.size_xyz[normal] || 1) - 1;
-    $('model-range-note').textContent = state.meta ? `Slices ${Math.max(0, frame-radius)+1}-${Math.min(last, frame+radius)+1} in the ${state.box?.plane || state.activePlane} plane. The same box is used on each slice; inspect all results.` : '';
-  }
-  $("run-model").hidden = confirmed || state.preview;
-  const runningJob = state.jobs.find((job) => ['queued', 'running'].includes(job.status));
-  $("run-model").textContent = running ? `Segmenting N${jobNoduleLabel(runningJob)}...` : "Run segmentation";
-  $("run-model").classList.toggle("primary", flow.step === 1);
-  $("draw-lesion").hidden = confirmed || flow.step !== 1;
-  $("draw-lesion").disabled = !ready || !nodule;
-  $("draw-lesion").textContent = validBox ? "Redraw box" : "Draw lesion box";
   $("confirm-case").hidden = confirmed;
   $("confirm-case").disabled = !ready || !flow.canConfirm;
   $("confirm-case").classList.toggle("primary", flow.canConfirm);
@@ -666,25 +645,7 @@ function updateControls() {
   const volume = state.preview ? state.job?.result?.volume_ml : nodule?.volume_ml;
   $("selected-nodule-name").textContent = nodule ? `${nodule.id} / ${nodule.name}` : 'No nodule selected';
   document.querySelector('.target-card .mask-dot').style.background = state.preview ? '#f0be63' : `rgb(${(nodule?.color || [104,237,182]).join(',')})`;
-  $("mask-volume").textContent = volume === undefined ? "No saved mask" : `${volume.toFixed(3)} mL / ${state.preview ? "AI preview, unsaved" : "selected nodule"}`;
-  $("prompt-info").textContent = validBox ? `${nodule?.id || ''} / ${state.box.plane || 'axial'} slice ${state.box.frame_index + 1} / box ${state.box.box_xyxy.map((n) => Math.round(n)).join(", ")} px` : "No bounding box defined";
-  $("job-panel").hidden = !state.job;
-  $("accept-proposal").hidden = !state.preview || state.job?.status !== "succeeded" || confirmed;
-  if (state.job) {
-    const status = state.job.status;
-    $("job-status").textContent = {queued: "Queued", running: "Segmenting (CPU)", succeeded: "Segmentation complete", cancelled: "Job cancelled", failed: "Inference failed"}[status] || status;
-    const thisRunning = ['queued', 'running'].includes(status);
-    $("job-progress").hidden = !thisRunning; $("cancel-job").hidden = !thisRunning;
-    $("preview-proposal").hidden = status !== "succeeded" || confirmed;
-    $("preview-proposal").textContent = state.preview ? "Show saved mask" : "Preview model mask";
-    $("preview-proposal").disabled = !ready;
-    $("accept-proposal").disabled = !ready || !flow.freshProposal || confirmed;
-    $("accept-proposal").textContent = !flow.freshProposal ? "Result is outdated" : "Use result & edit";
-    const result = state.job.result;
-    $("job-detail").textContent = thisRunning ? `CPU inference for N${jobNoduleLabel(state.job)}. ${state.job.progress ? `${state.job.progress.completed} / ${state.job.progress.total} slices ${state.job.progress.phase === 'encoding' ? 'encoded' : 'segmented'}.` : 'Loading model.'} You can work on other nodules.` :
-      status === "succeeded" ? `${result.elapsed_seconds.toFixed(0)} seconds / ${result.volume_ml.toFixed(3)} mL. ${result.touches_crop_boundary ? "WARNING: mask reaches a processed boundary; inspect and extend the range if needed. " : ""}${result.empty_prediction ? "The model returned an empty mask. " : ""}Preview replaces only N${jobNoduleLabel(state.job)}; other colors are saved nodules. Red overlap must be resolved.` : state.job.error || "No draft was changed.";
-    $("model-provenance").textContent = result ? JSON.stringify(result, null, 2) : "";
-  }
+  $("mask-volume").textContent = volume === undefined ? "No saved mask" : `${volume.toFixed(3)} mL / ${state.preview ? "unsaved preview" : "selected nodule"}`;
   if (undoQueue.pending && !undoQueue.running && undoQueue.canRun()) task(() => undoQueue.drain())();
   clinicalCopy();
 }
@@ -707,79 +668,6 @@ function renderHistory() {
   }
 }
 
-$("draw-lesion").addEventListener("click", () => {setTool("box"); notify("Drag a box around one lesion in the axial, coronal or sagittal image.");});
-$("run-model").addEventListener("click", task(startSegmentation));
-async function startSegmentation() {
-  if (state.busy || $("run-model").disabled) return;
-  state.busy = true; updateControls();
-  try {
-    state.job = await post(`${base()}/jobs`, {...state.box, version: state.meta.version, nodule_label: state.selectedNodule,
-      slice_radius: Number($('model-slice-radius').value), window_level: state.meta.modality === 'CT' ? state.window.level : 40,
-      window_width: state.meta.modality === 'CT' ? state.window.width : 400});
-    state.jobs = [state.job, ...state.jobs]; state.meta.jobs = state.jobs;
-    state.runningJobId = state.job.id;
-    state.noduleBoxes[state.selectedNodule] = state.box;
-    state.proposal = null; state.preview = false; schedulePoll(); notify(`Segmentation submitted for N${state.selectedNodule}.`);
-  } catch (error) {if (error.status === 409) await reloadDraft(); throw error;}
-  finally {state.busy = false; updateControls();}
-}
-function schedulePoll() {clearTimeout(pollTimer); pollTimer = setTimeout(task(pollJob), 1800);}
-async function pollJob() {
-  const id = state.id, jobId = state.runningJobId;
-  if (!jobId) return;
-  try {
-    const job = await json(`${base(id)}/jobs/${jobId}`);
-    if (state.id !== id || state.runningJobId !== jobId) return;
-    state.jobs = state.jobs.map((item) => item.id === jobId ? job : item); state.meta.jobs = state.jobs;
-    if (state.job?.id === jobId) state.job = job;
-    updateControls();
-    if (["queued", "running"].includes(job.status)) schedulePoll();
-    else if (job.status === "succeeded") {
-      if (state.busy || pendingPoint || pointSave || views.some((v) => v.drag)) {schedulePoll(); return;}
-      state.runningJobId = null;
-      if (state.job?.id === jobId && proposalIsCurrent(job, state.meta, state.selectedNodule) && !state.meta.confirmation) {
-        await showProposal(); notify(`N${jobNoduleLabel(job)} result ready. Inspect the preview, then choose Use result & edit.`);
-      } else notify(`N${jobNoduleLabel(job)} segmentation finished. Select that nodule to inspect the result; edited targets require a new run.`);
-    } else state.runningJobId = null;
-  } catch (error) { if (state.id === id) { schedulePoll(); notify(`Job status unavailable: ${error.message}`, true); } }
-}
-$("cancel-job").addEventListener("click", task(async () => {
-  const id = state.id, jobId = state.job.id;
-  const job = await post(`${base(id)}/jobs/${jobId}/cancel`, {});
-  if (id === state.id) {
-    state.jobs = state.jobs.map((item) => item.id === jobId ? job : item); state.meta.jobs = state.jobs;
-    if (jobId === state.job?.id) state.job = job;
-    if (state.runningJobId === jobId) {state.runningJobId = null; clearTimeout(pollTimer);}
-    updateControls();
-  }
-}));
-$("preview-proposal").addEventListener("click", task(() => showProposal(!state.preview)));
-async function showProposal(show = true) {
-  if (state.busy || state.loading || pendingPoint || pointSave || views.some((v) => v.drag)) return;
-  if (!state.job || jobNoduleLabel(state.job) !== state.selectedNodule || !activeNodule()) return;
-  state.busy = true; updateControls();
-  try {
-    if (!state.proposal) {
-      const buffer = await (await api(`${base()}/mask?job_id=${state.job.id}`)).arrayBuffer();
-      if (buffer.byteLength !== state.volume.length) throw new Error("Proposal transfer size mismatch");
-      state.proposal = new Uint8Array(buffer);
-    }
-    state.preview = show;
-    if (state.preview) {
-      state.overlay = true; $("toggle-overlay").classList.add("active");
-      const bounds = state.job.prompt.box_xyxy;
-      const plane = state.job.prompt.plane || "axial", [a, b, normal] = axes(plane);
-      state.cross[a] = Math.round((bounds[0] + bounds[2]) / 2); state.cross[b] = Math.round((bounds[1] + bounds[3]) / 2); state.cross[normal] = state.job.prompt.frame_index;
-      selectView(plane); if (state.focusedPlane) focusView(plane);
-    }
-  } finally {state.busy = false; updateControls(); requestRender();}
-}
-$("accept-proposal").addEventListener("click", task(async () => {
-  if ($("accept-proposal").disabled) return;
-  if (await mutate(`${base()}/jobs/${state.job.id}/accept`, {})) {
-    setTool("brush"); notify(`N${state.selectedNodule} updated. Other nodules are unchanged. Brush / Erase to correct; Cmd/Ctrl+Z to undo.`);
-  }
-}));
 
 let deleteTarget = null;
 for (const button of document.querySelectorAll("[data-delete-mask]")) button.addEventListener("click", () => {
@@ -849,7 +737,6 @@ async function changeReview(action, payload = {version: state.meta?.version}) {
   finally {state.busy = false; updateControls(); requestRender(); task(() => undoQueue.drain())();}
 }
 $("overlay-opacity").addEventListener("input", requestRender);
-$('model-slice-radius').addEventListener('change', updateControls);
 $("reset-view").addEventListener("click", () => {views.forEach((v) => {v.zoom = 1; v.pan = [0, 0];}); requestRender();});
 $("toggle-mpr").addEventListener("click", () => focusView(state.focusedPlane ? null : state.activePlane));
 $("zoom-in").addEventListener("click", () => zoomView(views.find((v) => v.plane === state.activePlane), 1.25));
@@ -909,7 +796,7 @@ document.addEventListener("keydown", (event) => {
   if (views.some((v) => v.drag)) return;
   if (event.ctrlKey || event.metaKey || event.altKey) return;
   if (key === 'f' && !event.repeat) {event.preventDefault(); fullscreen.toggle().catch(handle); return;}
-  const tool = {v: "crosshair", b: "box", p: "brush", e: "erase", h: "pan", z: "zoom"}[key];
+  const tool = {v: "crosshair", p: "brush", e: "erase", h: "pan", z: "zoom"}[key];
   if (key === "+" || key === "=" || key === "-") {event.preventDefault(); zoomView(views.find((v) => v.plane === state.activePlane), key === "-" ? .8 : 1.25);}
   if (tool) setTool(tool); if (key === "m") toggleOverlay();
 });
@@ -1024,14 +911,8 @@ async function init() {
   $("test-identity").value = identityId;
   $("test-identity").title = identities.notice;
   clinicalCopy();
-  state.model = await json("/api/lung/model");
-  $('model-name').textContent = state.model.name;
-  $('model-scope').textContent = state.model.scope;
-  $('model-terms').textContent = `${state.model.license} ${state.model.validation}`;
-  $('model-range-control').hidden = state.model.id !== 'litemedsam-onnx';
-  $('model-preprocessing').textContent = state.model.id === 'litemedsam-onnx' ? 'CT: current display window in HU. MRI: 0.5-99.5 percentile clipping and slice normalization. Not whole-volume detection.' : 'Input requirement: CT intensities in Hounsfield units (HU), not normalized image values.';
-  $("connection").textContent = state.model.available ? "Model available (CPU)" : "Model unavailable";
-  $("model-availability").textContent = state.model.available ? `${state.model.name} ready. Inspect every proposal before accepting.` : "Model not configured. Manual annotation is available.";
+  state.model = {id: "none", available: false, modalities: []};
+  $("connection").textContent = "Manual annotation";
   await loadCases();
   const initial = new URLSearchParams(location.search).get("study_id");
   if (initial) await openCase(initial); selectView(state.activePlane); setTool(state.tool); updateControls();

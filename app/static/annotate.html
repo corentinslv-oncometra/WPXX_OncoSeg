@@ -52,11 +52,8 @@
       <button id="toggle-fullscreen" type="button" aria-pressed="false" aria-keyshortcuts="F" title="Enter full screen (F)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg><span>Full screen</span></button>
     </div>
     <section id="workflow-bar" class="workflow-bar" aria-label="Case workflow">
-      <div class="workflow-copy"><ol class="workflow-steps" aria-label="Annotation progress"><li data-step="1">1 <span>Segment</span></li><li data-step="2">2 <span>Inspect / edit</span></li><li data-step="3">3 <span>Completed</span></li><li data-step="4">4 <span>Approved</span></li></ol><p id="workflow-hint" role="status">Select a CT case to begin.</p></div>
+      <div class="workflow-copy"><ol class="workflow-steps" aria-label="Annotation progress"><li data-step="1">1 <span>Annotate</span></li><li data-step="2">2 <span>Inspect / edit</span></li><li data-step="3">3 <span>Completed</span></li><li data-step="4">4 <span>Approved</span></li></ol><p id="workflow-hint" role="status">Select a CT case to begin.</p></div>
       <div class="workflow-actions">
-        <button id="draw-lesion" disabled>Draw lesion box</button>
-        <button id="run-model" class="primary" disabled>Run segmentation</button>
-        <button id="accept-proposal" class="primary" hidden>Use result &amp; edit</button>
         <button id="confirm-case" disabled>Mark completed</button>
         <button id="approve-case" class="primary" hidden>Approve case</button>
         <button id="reopen-case" hidden>Reopen case</button>
@@ -74,7 +71,6 @@
     <div id="annotation-layout" class="annotation-layout">
       <aside class="tool-rail" aria-label="Annotation tools">
         <button data-tool="crosshair" title="Linked crosshair (V)" class="active"><svg viewBox="0 0 24 24"><path d="M12 2v7m0 6v7M2 12h7m6 0h7"/><circle cx="12" cy="12" r="5"/></svg><span>Locate</span></button>
-        <button data-tool="box" title="Draw a segmentation box in any plane (B)"><svg viewBox="0 0 24 24"><path d="M4 9V4h5m6 0h5v5m0 6v5h-5m-6 0H4v-5"/></svg><span>AI box</span></button>
         <button data-tool="brush" title="Paint mask (P)"><svg viewBox="0 0 24 24"><path d="m8 15 9-11 3 3L9 18M8 15c-5-1-2 5-5 5 6 1 8-2 5-5Z"/></svg><span>Brush</span></button>
         <button data-tool="erase" title="Erase mask (E)"><svg viewBox="0 0 24 24"><path d="m4 14 10-10 7 7-10 10H8l-4-4Zm6-6 7 7M10 21h12"/></svg><span>Erase</span></button>
         <button data-delete-mask disabled title="Delete the entire nodule mask across all slices; undoable" aria-label="Delete nodule mask"><svg viewBox="0 0 24 24"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7"/></svg><span>Delete</span></button>
@@ -86,7 +82,7 @@
         <button id="undo" disabled title="Undo the last edit (Ctrl/Cmd+Z)"><svg viewBox="0 0 24 24"><path d="M8 5 3 10l5 5M3 10h11a6 6 0 0 1 0 12"/></svg><span>Undo</span></button>
       </aside>
       <section id="viewports" class="viewports" aria-label="Linked CT views">
-        <div class="viewport axial" data-plane="axial"><div class="viewport-label"><b>AXIAL</b><span class="plane-position"></span></div><canvas aria-label="Axial CT image. Draw a box here to prompt the model."></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><input type="range" min="0" value="0" aria-label="Axial slice"></div></div>
+        <div class="viewport axial" data-plane="axial"><div class="viewport-label"><b>AXIAL</b><span class="plane-position"></span></div><canvas aria-label="Axial image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><input type="range" min="0" value="0" aria-label="Axial slice"></div></div>
         <div class="viewport coronal" data-plane="coronal"><div class="viewport-label"><b>CORONAL</b><span class="plane-position"></span></div><canvas aria-label="Coronal CT image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><input type="range" min="0" value="0" aria-label="Coronal slice"></div></div>
         <div class="viewport sagittal" data-plane="sagittal"><div class="viewport-label"><b>SAGITTAL</b><span class="plane-position"></span></div><canvas aria-label="Sagittal CT image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><input type="range" min="0" value="0" aria-label="Sagittal slice"></div></div>
         <div id="viewer-empty" class="viewer-empty"><h2>No CT selected</h2><p>Select a CT series from the worklist.</p><button data-page="cases">Open worklist</button></div>
@@ -98,17 +94,10 @@
         <div class="target-card"><span class="mask-dot"></span><div><strong id="selected-nodule-name">No nodule selected</strong><span id="mask-volume">No saved mask</span></div><span id="revision-tag" class="pill">v0</span></div>
         <div class="target-actions"><button id="delete-nodule" data-delete-mask class="danger-outline wide" disabled>Delete nodule mask</button><p id="delete-mask-note" class="fine-print">Deletes only the selected nodule. Others are preserved.</p></div>
         <div id="confirmation-note" class="confirmation-note" hidden></div>
-        <div class="inspector-section"><div class="section-heading"><h3>Model-assisted segmentation</h3><span class="cpu-badge">CPU</span></div><strong id="model-name" class="model-name">Segmentation model</strong><p id="model-scope" class="muted">Draw a box in the axial, coronal or sagittal view.</p>
-          <label id="model-range-control" class="fine-print" hidden>Slice range<select id="model-slice-radius" aria-label="Segmentation slice range"><option value="0">Current slice only</option><option value="2">5 slices</option><option value="4" selected>9 slices</option><option value="8">17 slices</option><option value="15">31 slices</option></select></label><p id="model-range-note" class="fine-print"></p>
-          <div id="prompt-info" class="prompt-info">No bounding box defined</div>
-          <p id="model-preprocessing" class="fine-print">CT uses the selected window; MRI uses percentile clipping and slice normalization.</p>
-          <div id="job-panel" class="job-panel" hidden><div class="job-heading"><span id="job-status">Queued</span><button id="cancel-job" class="text-button">Cancel</button></div><div id="job-progress" class="indeterminate" hidden></div><p id="job-detail" class="muted"></p><button id="preview-proposal" class="wide" hidden>Preview model mask</button></div>
-          <p id="model-availability" class="fine-print">Checking model configuration...</p>
-        </div>
         <div class="inspector-section"><h3>Mask editing</h3><div class="edit-tool-buttons"><button data-tool="brush">Brush</button><button data-tool="erase">Erase</button></div><p class="muted">Select Brush or Erase for Circle / 3D Sphere controls above the images. Size is the physical diameter in mm; each tool retains its own settings.</p><p class="fine-print">Edits save automatically. Cmd/Ctrl+Z undoes a stroke or full-mask deletion.</p><label class="slider-label">Overlay opacity <input id="overlay-opacity" type="range" min="0" max="0.8" step="0.05" value="0.3"></label></div>
         <details class="inspector-section"><summary>Case revision history <span id="history-count">0</span></summary><p class="fine-print">Each snapshot contains all nodules. Restoring a snapshot restores the whole case. Local test attribution only.</p><div id="history-list"></div><h3 class="review-history-title">Case review events</h3><div id="review-history"></div></details>
         <details class="inspector-section"><summary>Source DICOM</summary><button id="download-dicom" class="wide" disabled>Download DICOM folder (.zip)</button><p id="dicom-source-note" class="fine-print">Original DICOM download becomes available after folder or ZIP import.</p></details>
-        <details class="inspector-section"><summary>Model &amp; geometry details</summary><div id="geometry-info" class="fine-print"></div><p id="model-terms" class="fine-print">Model artifacts are checked before inference. No heuristic fallback. Outputs require human inspection.</p><p class="fine-print">Each run targets one selected nodule. Accepting a result replaces only that nodule. Other labels are protected; overlapping AI results require correction. IDs are not recycled.</p><pre id="model-provenance"></pre></details>
+        <details class="inspector-section"><summary>Image geometry</summary><div id="geometry-info" class="fine-print"></div></details>
       </aside>
     </div>
     <footer class="viewer-footer"><span id="interaction-hint">Double-click: focus/restore | Pinch: zoom | Scroll: slice | Cmd/Ctrl+Z: undo</span><span>Native-grid views &middot; Research only &middot; Not for diagnosis</span></footer>

@@ -12,9 +12,7 @@ export function workflowState({meta, job, jobs, preview, hasBox, modelAvailable,
   const incomplete = meta?.nodules?.filter((nodule) => !nodule.voxel_count) || [];
   const running = (jobs || [job]).some((item) => ['queued', 'running'].includes(item?.status));
   const freshProposal = proposalIsCurrent(job, meta, noduleLabel);
-  let hint = !modelAvailable ? 'Model unavailable. Use Brush to create a manual mask.' :
-    !hasBox ? 'Draw a box around one lesion in any plane, then run segmentation.' :
-    'Lesion box ready. Run segmentation to generate a proposed mask.';
+  let hint = 'Use Brush to draw the mask on the selected lesion.';
   if (selectedHasMask) hint = `Inspect ${selected?.id || 'the mask'} in all planes. Edits affect only this nodule.`;
   if (incomplete.length && hasMask) hint += ` Empty: ${incomplete.map((nodule) => nodule.id).join(', ')}. Annotate or delete before completion.`;
   if (meta?.nodules && !selected) hint = 'No nodules remain. Add a nodule to annotate; Undo restores the last deletion.';

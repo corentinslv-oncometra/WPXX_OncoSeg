@@ -79,6 +79,28 @@ def complete(client, study_id):
     return client.get(base).json()
 
 
+def test_seeded_demo_volumes_are_removed_from_the_workspace(clients):
+    admin, _, _ = clients
+    info = json.loads((Path(__file__).resolve().parents[1] / "demo-cases" / "lung-ct" / "case.json").read_text())
+    kept = fixture_case()
+    case = WorkspaceCase(id=str(uuid4()), project_id=info["project_id"], patient_id=info["patient_id"],
+                         modality=info["modality"], source=info)
+    directory = image_directory(case)
+    directory.mkdir(parents=True)
+    (directory / "image.nii.gz").write_bytes(b"demo-placeholder")
+    with SessionLocal() as db:
+        db.add(case)
+        db.commit()
+    assigned(admin, case)
+    from app.oncometra import seed_demo
+    seed_demo()
+    workspace = admin.get("/api/workspace").json()
+    assert [item["patient_id"] for item in workspace["cases"]] == [kept.patient_id]
+    assert not directory.exists()
+    with SessionLocal() as db:
+        assert db.get(WorkspaceCase, case.id) is None
+
+
 def test_authentication_and_csrf(clients):
     admin, reader, reviewer=clients
     with TestClient(app) as anonymous:
@@ -273,34 +295,3 @@ def test_import_limits_and_valid_mri(clients):
     assert reader.post('/api/import',data={'project_id':'brain-mr','patient_id':'UPLOADED-MR','deidentified':'false'},files={'files':('image.nii.gz',payload)}).status_code==422
     result=reader.post('/api/import',data={'project_id':'brain-mr','patient_id':'UPLOADED-MR','deidentified':'true'},files={'files':('image.nii.gz',payload)})
     assert result.status_code==422
-
-
-@pytest.mark.parametrize('plane', ['axial', 'coronal', 'sagittal'])
-def test_actual_medsam_jobs_are_proposals_and_undoable(clients, plane):
-    admin, reader, reviewer=clients
-    study_id=assigned(reader,fixture_case('MR'))
-    base=f'/api/lung/studies/{study_id}'
-    state=reader.get(base).json()
-    started=reader.post(base+'/jobs',json={'version':state['version'],'plane':plane,'frame_index':12,
-        'box_xyxy':[6,6,17,17],'slice_radius':0})
-    assert started.status_code==202,started.text
-    job_id=started.json()['id']
-    for _ in range(300):
-        job=reader.get(base+'/jobs/'+job_id).json()
-        if job['status'] not in ('queued','running'):
-            break
-        time.sleep(.1)
-    assert job['status']=='succeeded',job
-    assert job['result']['model_id']=='litemedsam-onnx'
-    assert job['result']['slices_processed']==1
-    assert job['result']['modality']=='MR'
-    assert job['progress']=={'completed':1,'total':1,'phase':'decoding'}
-    assert not list(lung.job_folder(study_id,job_id).glob('medsam-embeddings-*'))
-    assert reader.get(base).json()['revision_id'] is None
-    assert reader.get(base+'/mask',params={'job_id':job_id}).status_code==200
-    accepted=reader.post(base+'/jobs/'+job_id+'/accept',json={'version':state['version']})
-    assert accepted.status_code==200,accepted.text
-    new=reader.get(base).json()
-    assert new['revision_id'] is not None
-    assert reader.post(base+'/restore-initial',json={'version':new['version']}).status_code==200
-    assert all(nodule['voxel_count']==0 for nodule in reader.get(base).json()['nodules'])

@@ -79,7 +79,7 @@ through the existing case workflow, not the entire acquisition database.
 This change is a tested integration foundation, not completion of the production
 architecture. In particular:
 
-- Migrate MedSAM and feature extraction to durable, separately deployable workers;
+- Migrate feature extraction to a durable, separately deployable worker;
   their current single-web-instance constraints are unchanged.
 - Replace per-assignment image copies/local paths with immutable image-asset IDs
   and bounded worker/viewer caches. The current layout keeps images and SQLite

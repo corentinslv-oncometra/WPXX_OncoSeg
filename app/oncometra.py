@@ -31,11 +31,14 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db import Base, engine, SessionLocal
-from app.models import Patient, StudyRecord, WorklistItem, AnnotationHead, AnnotationRevision
+from app.models import (
+    Patient, StudyRecord, WorklistItem, Report, AiTask, AiArtifact, Appointment,
+    BillingItem, ViewerMeasurement, AnnotationHead, AnnotationRevision, AnnotationReviewEvent,
+    AnnotationTaskEvent, LungSegmentationJob,
+)
 from app.oncometra_models import WorkspaceUser, WorkspaceSession, WorkspaceCase, WorkspaceAssignment, WorkspaceFeatureJob, WorkspaceAudit
 from app.oncometra_models import WorkspaceProject, CaseSourceLink
 from app.platform_services import seed_projects, visible_projects, project_payload, prepare_import_link
-os.environ.setdefault("LUNG_MODEL_BACKEND", "litemedsam")
 from app import lung_api as lung
 from app.services.annotation_review import annotation_db, latest_task_event, task_status, actor_for
 from app.services.storage import DATA_ROOT
@@ -223,10 +226,76 @@ class BootstrapUser(BaseModel):
     role: str = Field(pattern=r"^(junior_annotator|senior_annotator|reviewer|admin)$")
 
 
+def demo_case_keys():
+    keys = set()
+    for manifest in (ROOT / "demo-cases").glob("*/case.json"):
+        info = json.loads(manifest.read_text())
+        keys.add((info["project_id"], info["patient_id"]))
+    return keys
+
+
+def _storage_path(path):
+    resolved = Path(path).resolve()
+    root = DATA_ROOT.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise RuntimeError(f"Refusing to delete a path outside storage: {resolved}")
+    return resolved
+
+
+def retire_seeded_demo_cases(db):
+    """Remove MSD demonstration volumes seeded into the workspace.
+
+    Projects stay. Cases the user imported under another source stay.
+    """
+    keys = demo_case_keys()
+    cases = [case for case in db.scalars(select(WorkspaceCase))
+             if (case.project_id, case.patient_id) in keys
+             and (case.source or {}).get("source") == "Medical Segmentation Decathlon"]
+    if not cases:
+        return []
+    case_ids = [case.id for case in cases]
+    study_ids = list(db.scalars(select(WorkspaceAssignment.study_id).where(WorkspaceAssignment.case_id.in_(case_ids))))
+    paths = [image_directory(case) for case in cases]
+    paths.extend(lung.store.study_dir(study_id) for study_id in study_ids)
+    if study_ids:
+        for model in (
+            WorkspaceFeatureJob, LungSegmentationJob, AnnotationTaskEvent, AnnotationReviewEvent,
+            AnnotationRevision, ViewerMeasurement, AiArtifact, AiTask, Report, Appointment,
+            BillingItem, WorklistItem, AnnotationHead, WorkspaceAssignment,
+        ):
+            db.execute(delete(model).where(model.study_id.in_(study_ids)))
+        db.execute(delete(StudyRecord).where(StudyRecord.id.in_(study_ids)))
+        db.execute(delete(CaseSourceLink).where(CaseSourceLink.case_id.in_(case_ids)))
+    db.flush()
+    for case in cases:
+        patient = db.scalar(select(Patient).where(Patient.patient_id == case.patient_id))
+        if patient and not db.scalar(select(StudyRecord.id).where(StudyRecord.patient_pk == patient.id)):
+            db.delete(patient)
+        db.delete(case)
+    return paths
+
+
+def import_demo_cases(db):
+    for manifest in sorted((ROOT / "demo-cases").glob("*/case.json")):
+        info = json.loads(manifest.read_text())
+        if db.scalar(select(WorkspaceCase).where(WorkspaceCase.project_id == info["project_id"], WorkspaceCase.patient_id == info["patient_id"])):
+            continue
+        case = WorkspaceCase(id=str(uuid4()), project_id=info["project_id"], patient_id=info["patient_id"], modality=info["modality"], source=info)
+        destination = image_directory(case)
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in ("image.nii.gz", "reference.nii.gz"):
+            data = (manifest.parent / name).read_bytes()
+            if hashlib.sha256(data).hexdigest() != info[name + "_sha256"]:
+                raise RuntimeError(f"Demo asset checksum mismatch: {manifest.parent.name}/{name}")
+            (destination / name).write_bytes(data)
+        db.add(case)
+
+
 def seed_demo():
     Base.metadata.create_all(engine)
     from app.platform_services import ensure_imaging_index_schema
     ensure_imaging_index_schema(engine)
+    removed_paths = []
     with SessionLocal() as db:
         seed_projects(db, PROJECTS)
         # Restarted work is never falsely reported as finished.
@@ -248,20 +317,15 @@ def seed_demo():
             account = BootstrapUser.model_validate(entry)
             if not db.scalar(select(WorkspaceUser).where(WorkspaceUser.username == account.username)):
                 db.add(WorkspaceUser(**account.model_dump(), projects=PROJECT_IDS))
-        for manifest in sorted((ROOT / "demo-cases").glob("*/case.json")):
-            info = json.loads(manifest.read_text())
-            if db.scalar(select(WorkspaceCase).where(WorkspaceCase.project_id == info["project_id"], WorkspaceCase.patient_id == info["patient_id"])):
-                continue
-            case = WorkspaceCase(id=str(uuid4()), project_id=info["project_id"], patient_id=info["patient_id"], modality=info["modality"], source=info)
-            destination = image_directory(case)
-            destination.mkdir(parents=True, exist_ok=True)
-            for name in ("image.nii.gz", "reference.nii.gz"):
-                data = (manifest.parent / name).read_bytes()
-                if hashlib.sha256(data).hexdigest() != info[name + "_sha256"]:
-                    raise RuntimeError(f"Demo asset checksum mismatch: {manifest.parent.name}/{name}")
-                (destination / name).write_bytes(data)
-            db.add(case)
+        if os.getenv("ONCOMETRA_SEED_DEMO_CASES") == "true":
+            import_demo_cases(db)
+        else:
+            removed_paths = retire_seeded_demo_cases(db)
         db.commit()
+    for path in removed_paths:
+        target = _storage_path(path)
+        if target.exists():
+            shutil.rmtree(target)
 
 
 @asynccontextmanager

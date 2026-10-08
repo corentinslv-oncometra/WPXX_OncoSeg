@@ -62,27 +62,10 @@ are marked failed and can be retried. Superseded approvals cannot be downloaded
 as current feature files. Extraction and segmentation share a single compute lock.
 Native-grid extraction is the default; very large resampling requests are rejected.
 
-## MedSAM
+## Annotation
 
-LiteMedSAM runs on CPU using ONNX Runtime, without PyTorch in the deployed app.
-The checked-in encoder and decoder derive from the official LiteMedSAM checkpoint;
-their hashes, source revision, license and conversion parity results are stored in
-`model-assets/litemedsam/manifest.json`. Build and inference verify artifact hashes.
-The upstream model is https://github.com/bowang-lab/MedSAM/tree/LiteMedSAM.
-
-Draw one box on axial, coronal or sagittal images. Select 1, 5, 9, 17 or 31 slices
-centered on that box's slice (clipped at volume boundaries). CT uses the current
-display window; MR uses 0.5/99.5 percentile clipping of positive image values and
-per-slice normalization. Every selected slice receives the same box independently.
-This is **2D MedSAM with a bounded slice range**, not MedSAM2, volumetric tracking,
-automatic tumor detection or tumor-specific clinical validation. Inspect the
-proposal, accept it explicitly, edit, complete and request independent review.
-Cancel terminates the isolated worker. Accepted proposals can be undone.
-
-Only the selected pixel slab is staged into the worker, not the full imaging
-runtime. Processes run one job at a time and exit after inference. Real CT/MR
-technical checks in all three planes are in `docs/litemedsam-technical-smoke.json`;
-their boxes are reference-derived, not evidence of independent clinical accuracy.
+No automatic segmentation model is installed. Readers draw and edit masks with the
+brush and eraser, then complete the case for independent review.
 
 To seed extra accounts on a fresh database, set `ONCOMETRA_BOOTSTRAP_USERS` to a
 JSON array containing `username`, `name`, `role` and a PBKDF2 password hash
@@ -95,7 +78,7 @@ assignments.
 ## Scope Boundaries
 
 - Brain CT and rectum MRI are empty until rights-cleared positive cases are verified.
-- MedSAM2 and tumor-specific models remain unconfigured; LiteMedSAM is the running adapter.
+- No automatic segmentation model is installed. Annotation is manual.
 - Demo images are derived, downsampled public NIfTI volumes, not original DICOM.
 - DICOM SEG, longitudinal response prediction, DICOM networking, EHR integration,
   SSO, audit retention guarantees, clinical/FDA validation and billing are absent.
@@ -108,8 +91,7 @@ assignments.
 ## Verification
 
 ```bash
-python -m pytest tests/test_oncometra.py tests/test_medsam_runtime.py -q
-python -m scripts.smoke_medsam
+python -m pytest tests/test_oncometra.py -q
 node --test tests/viewer-fullscreen.test.mjs
 ```
 
