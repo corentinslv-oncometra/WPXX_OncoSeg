@@ -1,10 +1,10 @@
-import {featureFileDialog} from '/assets/feature-export.mjs';
-import {platformWorkspace} from '/assets/platform-workspace.mjs?v=wp05-detail';
+import {platformWorkspace} from '/assets/platform-workspace.mjs?v=cohorts-2';
 const $ = id => document.getElementById(id);
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const statusName = value => ({new:'New',in_progress:'In progress',completed:'Completed',approved:'Approved',queued:'Queued',running:'Running',succeeded:'Extracted',failed:'Failed'}[value] || value);
+const roleName = value => ({admin:'Administrateur', reviewer:'Radiologue', junior_annotator:'Annotateur', senior_annotator:'Annotateur senior'}[value] || value);
+const statusName = value => ({new:'À annoter', in_progress:'Annotation en cours', completed:'À valider', approved:'Validé', queued:'En attente', running:'En cours', succeeded:'Extrait', failed:'Échec'}[value] || value);
 const badge = value => `<span class="status ${escape(value)}">${escape(statusName(value))}</span>`;
-const state = {user:null, data:null, tab:'projects', project:'', query:'', status:'', assignment:null, jobs:[], users:[]};
+const state = {user:null, data:null, tab:'datasets', project:'', query:'', status:'', assignment:null, jobs:[], users:[]};
 let toastTimer;
 async function api(path, data, method) {
   const options = {method:method || (data ? 'POST':'GET'), credentials:'same-origin', headers:{}};
@@ -20,90 +20,126 @@ function action(fn){return (...args)=>Promise.resolve().then(()=>fn(...args)).ca
 function showLogin(){$('login-screen').hidden=false;$('workspace').hidden=true;state.user=null;}
 function reviewAccess(){return ['reviewer','admin'].includes(state.user?.role);}
 function heading(title,subtitle,buttons=''){return `<div class="page-heading"><div><h1>${escape(title)}</h1>${subtitle?`<p>${escape(subtitle)}</p>`:''}</div><div class="actions">${buttons}</div></div>`;}
-function projectName(id){const project=state.data.projects.find(p=>p.id===id);return project?`${project.name} ${project.modality==='MR'?'MRI':'CT'}`:id;}
-function projectOptions(all=true){return `${all?'<option value="">All projects</option>':''}${state.data.projects.map(p=>`<option value="${p.id}" ${p.id===state.project?'selected':''}>${escape(projectName(p.id))}</option>`).join('')}`;}
+function cohortProjects(){return (state.data?.projects||[]).filter(project=>project.dataset);}
+function projectName(id){const project=state.data.projects.find(p=>p.id===id);return project?`${project.name} ${project.modality==='MR'?'IRM':'CT'}`:id;}
+function projectOptions(all=true, selected=state.project){return `${all?'<option value="">Toutes les cohortes</option>':''}${cohortProjects().map(p=>`<option value="${p.id}" ${p.id===selected?'selected':''}>${escape(projectName(p.id))}</option>`).join('')}`;}
 function showModal(title,html){$('modal-title').textContent=title;$('modal-body').innerHTML=html;$('modal').showModal();}
-async function refresh(render=true){state.data=await api('/api/workspace');$('work-count').textContent=state.data.assignments.length;$('storage-status').textContent=state.data.storage==='ephemeral'?'Temporary demo storage':'Persistent storage';if(render && state.tab!=='annotation') await showTab(state.tab);}
-async function showTab(tab){state.tab=tab;document.querySelectorAll('[data-tab]').forEach(button=>button.classList.toggle('selected',button.dataset.tab===tab));$('annotation-page').hidden=tab!=='annotation';$('content').hidden=tab==='annotation';if(tab==='annotation')return;const renders={projects:renderProjects,datasets:platform.renderDatasets,worklist:renderWorklist,review:renderReview,admin:renderAdmin};await renders[tab]();}
+function pendingCount(){
+  const ids=new Set(cohortProjects().map(project=>project.id));
+  return state.data.cases.filter(item=>ids.has(item.project_id) && !state.data.assignments.some(row=>row.case_id===item.id && row.status==='approved')).length;
+}
+async function refresh(render=true){state.data=await api('/api/workspace');$('work-count').textContent=pendingCount();$('storage-status').textContent=state.data.storage==='ephemeral'?'Stockage temporaire':'Stockage local';if(render && state.tab!=='annotation') await showTab(state.tab);}
+async function showTab(tab){state.tab=tab;const selected=tab==='annotation'?'review':tab;document.querySelectorAll('[data-tab]').forEach(button=>button.classList.toggle('selected',button.dataset.tab===selected));$('annotation-page').hidden=tab!=='annotation';$('content').hidden=tab==='annotation';if(tab==='annotation')return;const renders={datasets:platform.renderDatasets,cohorts:renderCohorts,review:renderReview,admin:renderAdmin};await renders[tab]();}
 
-function renderProjects(){
- const projects=state.data.projects;
- const total=state.data.cases.length, completed=new Set(state.data.assignments.filter(a=>['completed','approved'].includes(a.status)).map(a=>a.case_id)).size;
- const approved=new Set(state.data.assignments.filter(a=>a.status==='approved').map(a=>a.case_id)).size;
- $('content').innerHTML=heading('Projects','Cancer-of-origin cohorts with versioned annotation guidelines', `${state.user.role==='admin'?'<button data-platform-action="project-new">Create project</button>':''}<button data-action="import" class="primary">Import images</button>`)+
- `<div class="metrics"><div class="metric"><span>Imaging series</span><strong>${total}</strong><small>${projects.filter(p=>p.cases).length} populated projects</small></div><div class="metric"><span>Reader assignments</span><strong>${state.data.assignments.length}</strong><small>Independent annotation sets</small></div><div class="metric"><span>Submitted series</span><strong>${completed}</strong><small>At least one reader completed</small></div><div class="metric"><span>Approved series</span><strong>${approved}</strong><small>Independent reviewer approval</small></div></div>`+
- `<div class="section-label"><h2>Annotation projects</h2><span>CT / MRI only</span></div><div class="project-grid">${projects.map(project=>{
- const caseItem=state.data.cases.find(c=>c.project_id===project.id);
- return `<article class="project-card" style="--project-color:${project.color}"><div class="project-identity"><span class="project-code">${escape(project.name.slice(0,2).toUpperCase())}</span><div><h2>${escape(project.name)}</h2><p>${escape(project.target)}</p></div><span class="modality">${project.modality==='MR'?'MRI':'CT'}</span></div><div class="project-preview ${caseItem?'':'pending-preview'}">${caseItem?`<img src="/api/cases/${caseItem.id}/preview" alt="${escape(project.name)} reference slice" loading="lazy"><span class="preview-meta">${escape(caseItem.source.source_patient_id||caseItem.patient_id)}</span>`:'No images imported'}</div><div class="project-stats"><div><strong>${project.cases}</strong><span>Series</span></div><div><strong>${project.completed}</strong><span>Submitted</span></div><div><strong>${project.approved}</strong><span>Approved</span></div></div><div class="project-bottom"><span>${escape(project.cancer_origin)} / protocol v${project.version}</span><button data-project="${project.id}">Open project</button></div><div class="project-management">${state.user.role==='admin'?`<button data-platform-action="project-edit" data-id="${project.id}">Guidelines</button><button data-platform-action="project-members" data-id="${project.id}">Members</button>`:''}<button data-platform-action="project-manifest" data-id="${project.id}">Manifest</button></div></article>`;
- }).join('')}</div><p class="small-note">Counts refer to imported imaging series. One patient may have several series or visits; repeated reads are counted as assignments. Reference thumbnails are practice data, not model predictions.</p>`;
+function cohortStatus(project){
+  if(!project.cases) return {id:'failed', label:'Images non importées'};
+  if(project.cases && project.approved===project.cases) return {id:'approved', label:'Validé'};
+  if(project.completed) return {id:'completed', label:'À valider'};
+  return {id:'new', label:'Images prêtes'};
+}
+function cohortGaps(project){
+  const gaps=[];
+  if(project.dataset.commercial_use!=='permitted') gaps.push('licence non tranchée');
+  if(!project.cases) gaps.push('images non importées');
+  if(project.dataset.segmentations!==true && !project.approved) gaps.push('pas de masque');
+  return gaps;
+}
+function renderCohorts(){
+  const cohorts=cohortProjects();
+  const rows=cohorts.map(project=>{
+    const status=cohortStatus(project);
+    const gaps=cohortGaps(project);
+    return `<tr><td><strong>${escape(project.name)}</strong><small>${escape(project.dataset.name)} · ${project.modality==='MR'?'IRM':'CT'}</small>${gaps.length?`<small>Encore : ${escape(gaps.join(', '))}</small>`:''}</td><td><span class="status ${status.id}">${escape(status.label)}</span></td><td>${project.cases}</td><td>${project.approved}</td><td><div class="row-actions"><button type="button" disabled title="Aucun modèle de segmentation automatique n’est installé. Les radiologues annotent le masque à la main.">Lancer la segmentation</button><button data-import-project="${project.id}">Importer les images</button>${project.cases?`<button data-project="${project.id}">Voir les examens</button>`:''}</div><small>Segmentation automatique indisponible</small></td></tr>`;
+  }).join('');
+  $('content').innerHTML=heading('Cohortes','Les datasets que vous avez choisis.')+`<section class="table-panel">${cohorts.length?`<div class="table-scroll"><table><thead><tr><th>Cohorte</th><th>État</th><th>Images</th><th>Validés</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="empty"><h2>Aucune cohorte</h2><p>'+(state.user.role==='admin'?'Choisissez un dataset exploitable.':'Aucune cohorte n’est encore ouverte.')+'</p></div>'}</section><p class="small-note">La segmentation automatique n’est pas installée. Le bouton reste sur la ligne et ne lance rien. Les radiologues annotent le masque à la main.</p>`;
 }
 
-function filters(){return `<div class="filters"><input id="filter-query" aria-label="Search cases" placeholder="Search patient or reader" value="${escape(state.query)}"><select id="filter-project" aria-label="Project">${projectOptions()}</select><select id="filter-status" aria-label="Status"><option value="">All statuses</option>${['new','in_progress','completed','approved'].map(s=>`<option value="${s}" ${state.status===s?'selected':''}>${statusName(s)}</option>`).join('')}</select></div>`;}
-function filtered(rows){return rows.filter(row=>(!state.project||row.project_id===state.project)&&(!state.status||row.status===state.status)&&(`${row.patient_id} ${row.reader||''}`.toLowerCase().includes(state.query.toLowerCase())));}
-function wireFilters(){for(const name of ['query','project','status'])$(`filter-${name}`)?.addEventListener(name==='query'?'input':'change',event=>{state[name]=event.target.value;renderRows();});}
-function renderWorklist(){
- $('content').innerHTML=heading(state.project?projectName(state.project):'Worklist','Create an independent reading assignment or continue saved work.','<button data-action="import" class="primary">Import images</button>')+`<section class="table-panel">${filters()}<div id="worklist-rows"></div></section><p class="small-note">Opening a new assignment starts annotation. Completion freezes that submission; approval requires a different reviewer. Imported reference masks are labeled as practice data.</p>`;
- wireFilters();renderRows();
+function filters(){return `<div class="filters"><input id="filter-query" aria-label="Chercher un examen" placeholder="Chercher un examen" value="${escape(state.query)}"><select id="filter-project" aria-label="Cohorte">${projectOptions()}</select><select id="filter-status" aria-label="État"><option value="">Tous les états</option>${['new','in_progress','completed','approved'].map(s=>`<option value="${s}" ${state.status===s?'selected':''}>${statusName(s)}</option>`).join('')}</select></div>`;}
+function queueRows(){
+  const ids=new Set(cohortProjects().map(project=>project.id));
+  return state.data.cases.filter(item=>ids.has(item.project_id)).map(item=>{
+    const related=state.data.assignments.filter(row=>row.case_id===item.id);
+    const mine=related.find(row=>row.user_id===state.user.id && row.kind==='reader');
+    const status=mine?.status || (related.some(row=>row.status==='approved')?'approved':related.some(row=>row.status==='completed')?'completed':'new');
+    return {case:item, mine, related, status};
+  }).filter(row=>(!state.project||row.case.project_id===state.project)&&(!state.status||row.status===state.status)&&(row.case.patient_id.toLowerCase().includes(state.query.toLowerCase())));
 }
-function renderRows(){
- const mine=state.data.assignments.filter(a=>a.user_id===state.user.id);
- const rows=state.data.cases.map(c=>mine.find(a=>a.case_id===c.id && a.kind==='reader')||{...c,case_id:c.id,status:'new',reader:'Not assigned',isNew:true});
- const visible=filtered(rows);
- $('worklist-rows').innerHTML=visible.length?`<div class="table-scroll"><table><thead><tr><th>Patient / examination</th><th>Project</th><th>Reader</th><th>Status</th><th>Lesions</th><th></th></tr></thead><tbody>${visible.map(row=>`<tr><td><strong>${escape(row.patient_id)}</strong><small>${escape(state.data.cases.find(c=>c.id===row.case_id)?.source.sequence||row.modality||'')}</small></td><td>${escape(projectName(row.project_id))}</td><td>${escape(row.reader)}</td><td>${badge(row.status)}</td><td>${row.lesions??'--'}</td><td><div class="row-actions"><button class="${row.isNew?'primary':''}" ${row.isNew?`data-begin="${row.case_id}"`:`data-open="${row.id}"`}>${row.isNew?'Begin annotation':'Open'}</button>${reviewAccess()?`<button data-assign="${row.case_id}">Assign reader</button>`:''}${row.status==='approved'?`<button data-extract="${row.id}">Feature file</button>`:''}<button data-source="${row.case_id}" title="Dataset provenance">Source</button></div></td></tr>`).join('')}</tbody></table></div>`:`<div class="empty"><h2>${state.project?'No verified demo case in this project':'No matching examinations'}</h2><p>${escape(state.data.projects.find(p=>p.id===state.project)?.pending||'Change filters or import a de-identified CT or MRI volume.')}</p></div>`;
+function wireFilters(){for(const name of ['query','project','status'])$(`filter-${name}`)?.addEventListener(name==='query'?'input':'change',event=>{state[name]=event.target.value;renderQueue();});}
+function renderQueue(){
+  const visible=queueRows();
+  $('queue-rows').innerHTML=visible.length?`<div class="table-scroll"><table><thead><tr><th>Examen</th><th>Cohorte</th><th>Proposition</th><th>État</th><th></th></tr></thead><tbody>${visible.map(row=>{
+    const pending=row.related.find(item=>item.user_id!==state.user.id && item.status==='completed');
+    const adjudicate=row.related.find(item=>item.user_id!==state.user.id && ['completed','approved'].includes(item.status));
+    let actions='';
+    if(!row.mine) actions+=`<button class="primary" data-begin="${row.case.id}">Annoter</button>`;
+    else if(['new','in_progress'].includes(row.mine.status)) actions+=`<button class="primary" data-open="${row.mine.id}">Annoter</button>`;
+    else actions+=`<button data-open="${row.mine.id}">Ouvrir</button>`;
+    if(reviewAccess() && pending) actions+=`<button class="primary" data-approve="${pending.id}">Approuver</button><button data-return="${pending.id}">Renvoyer</button><button data-adjudicate="${pending.id}">Arbitrer</button>`;
+    else if(reviewAccess() && adjudicate && adjudicate.status==='approved') actions+=`<button data-adjudicate="${adjudicate.id}">Arbitrer</button>`;
+    return `<tr><td><strong>${escape(row.case.patient_id)}</strong><small>${escape(row.case.source?.sequence||row.case.modality||'')}</small></td><td>${escape(projectName(row.case.project_id))}</td><td>Aucune<small>Annotation manuelle</small></td><td>${badge(row.status)}</td><td><div class="row-actions">${actions}</div></td></tr>`;
+  }).join('')}</tbody></table></div>`:`<div class="empty"><h2>${cohortProjects().length?'Aucun examen':'Aucune cohorte ouverte'}</h2><p>${cohortProjects().length?'Importez les images d’une cohorte pour les faire annoter.':'Les examens apparaissent ici une fois une cohorte ouverte et ses images importées.'}</p></div>`;
+}
+function renderReview(){
+  if(!$('queue-rows')){
+    $('content').innerHTML=heading('À valider','Chaque examen montre la proposition du modèle. Sans proposition, le radiologue annote le masque, puis valide.')+`<section class="table-panel">${filters()}<div id="queue-rows"></div></section><p class="small-note">Approuver, renvoyer et arbitrer sont les actions de cette file. Une lecture ne peut pas être approuvée par son auteur.</p>`;
+    wireFilters();
+  }
+  renderQueue();
 }
 async function openAssignment(id){
- let row=state.data.assignments.find(a=>a.id===id);if(!row){await refresh(false);row=state.data.assignments.find(a=>a.id===id);}
- if(!row)throw new Error('Assignment not found');state.assignment=row;$('annotation-tab').hidden=false;$('annotation-name').textContent=row.patient_id;
- $('assignment-context').textContent=`${projectName(row.project_id)} / ${row.reader}${row.user_id===state.user.id?'':' / Read-only review'}`;
- $('reference-load').hidden=row.user_id!==state.user.id||row.kind!=='reader'||!!row.revision_id||!state.data.cases.find(c=>c.id===row.case_id)?.source.reference_voxels;
- $('feature-export').hidden=row.status!=='approved';
- $('viewer').src=`/viewer?study_id=${id}&embedded=1`;await showTab('annotation');
-}
-async function renderReview(){
- const rows=state.data.assignments.filter(a=>['completed','approved'].includes(a.status));
- $('content').innerHTML=heading('Review','Inspect submitted revisions, return work, or create a separate adjudication.',reviewAccess()?'<button data-action="compare">Compare two readings</button>':'')+`<section class="table-panel"><div class="table-scroll"><table><thead><tr><th>Patient</th><th>Project</th><th>Reader</th><th>Lesions / volume</th><th>Status</th><th></th></tr></thead><tbody>${rows.map(row=>`<tr><td><strong>${escape(row.patient_id)}</strong><small>${row.kind==='adjudication'?'Adjudicated copy':'Independent assignment'}</small></td><td>${escape(projectName(row.project_id))}</td><td>${escape(row.reader)}</td><td>${row.lesions} / ${row.volume_ml.toFixed(2)} mL</td><td>${badge(row.status)}</td><td><div class="row-actions"><button data-open="${row.id}">Inspect</button>${row.user_id!==state.user.id&&row.status==='completed'?`<button data-approve="${row.id}" class="primary">Approve</button><button data-return="${row.id}">Return</button>`:''}<button data-adjudicate="${row.id}">Adjudicate</button>${row.status==='approved'?`<button data-extract="${row.id}">Feature file</button>`:''}</div></td></tr>`).join('')}</tbody></table></div>${rows.length?'':'<div class="empty"><h2>No submissions awaiting review</h2><p>Complete an annotation to make its frozen revision available here.</p></div>'}</section><p class="small-note">Readers cannot access another reader\'s masks. Reviewers can inspect them; adjudication creates a separate copy and preserves the source submission. Reference-assisted practice readings are not independent validation data.</p>`;
+  let row=state.data.assignments.find(a=>a.id===id);if(!row){await refresh(false);row=state.data.assignments.find(a=>a.id===id);}
+  if(!row)throw new Error('Lecture introuvable');state.assignment=row;
+  $('assignment-context').textContent=`${projectName(row.project_id)} / ${row.reader}${row.user_id===state.user.id?'':' / lecture seule'}`;
+  $('viewer').src=`/viewer?study_id=${id}&embedded=1`;await showTab('annotation');
 }
 async function renderAdmin(){
- state.users=await api('/api/users');const events=await api('/api/audit');
- $('content').innerHTML=heading('Administration','Accounts and access for the Oncometra demonstration.','<button class="primary" data-action="add-user">Add account</button>')+`<div class="two-columns"><section class="table-panel"><div class="filters"><h2>Workspace accounts</h2></div><table><thead><tr><th>Name</th><th>Username</th><th>Role</th></tr></thead><tbody>${state.users.map(user=>`<tr><td>${escape(user.name)}</td><td>${escape(user.username)}</td><td>${escape(user.role.replaceAll('_',' '))}</td></tr>`).join('')}</tbody></table></section><section class="panel"><h2>Deployment boundaries</h2><p>Public, de-identified demonstration data only. Authentication and reader isolation are enforced by the API.</p><p>Free-instance data is temporary unless durable storage is configured. Do not upload company patient data. Export completed work before restarts.</p><p>Single-instance processing; one radiomics job at a time. Load testing, persistent object storage, SSO, and clinical validation remain production gates.</p></section></div><div class="section-label" style="margin-top:30px"><h2>Recent workspace events</h2><span>Latest 100 events</span></div><section class="table-panel"><table><thead><tr><th>Event</th><th>Subject</th><th>Time</th></tr></thead><tbody>${events.slice(0,25).map(event=>`<tr><td>${escape(event.action.replaceAll('_',' '))}</td><td>${escape(event.subject_id?.slice(0,12)||'Account')}</td><td>${new Date(event.created_at+'Z').toLocaleString()}</td></tr>`).join('')}</tbody></table></section>`;
+  state.users=await api('/api/users');
+  $('content').innerHTML=heading('Comptes','Création des radiologues.','<button class="primary" data-action="add-user">Créer un radiologue</button>')+`<section class="table-panel"><table><thead><tr><th>Nom</th><th>Identifiant</th><th>Rôle</th></tr></thead><tbody>${state.users.map(user=>`<tr><td>${escape(user.name)}</td><td>${escape(user.username)}</td><td>${escape(roleName(user.role))}</td></tr>`).join('')}</tbody></table></section>`;
 }
-async function assignReader(caseId){state.users=await api('/api/users');showModal('Assign an independent reader',`<form id="assign-form"><label class="form-label">Reader<select name="reader">${state.users.map(u=>`<option value="${u.id}">${escape(u.name)} / ${escape(u.role.replaceAll('_',' '))}</option>`).join('')}</select></label><p class="small-note">The reader starts with an empty mask. Existing assignments are resumed, not replaced.</p><button class="primary">Assign case</button></form>`);$('assign-form').onsubmit=action(async event=>{event.preventDefault();await api(`/api/cases/${caseId}/assign`,{user_id:new FormData(event.target).get('reader')});$('modal').close();await refresh();toast('Reader assigned.');});}
-function addUser(){showModal('Add workspace account',`<form id="user-form"><label class="form-label">Name<input name="name" required maxlength="120"></label><label class="form-label">Username<input name="username" required pattern="[a-z0-9][a-z0-9._-]{2,79}" autocomplete="off"></label><label class="form-label">Temporary password<input name="password" type="password" required minlength="12" autocomplete="new-password"></label><label class="form-label">Role<select name="role"><option value="junior_annotator">Junior annotator</option><option value="senior_annotator">Senior annotator</option><option value="reviewer">Reviewer</option><option value="admin">Admin + reviewer (demo)</option></select></label><p class="small-note">The account has access to the current seven demo projects. Share credentials privately.</p><button class="primary">Create account</button></form>`);$('user-form').onsubmit=action(async event=>{event.preventDefault();await api('/api/users',Object.fromEntries(new FormData(event.target)));$('modal').close();await renderAdmin();toast('Account created.');});}
-function importImages(cohortItem=null){showModal('Import de-identified images',`<form id="import-form"><label class="form-label">Project<select name="project_id">${projectOptions(false)}</select></label><label class="form-label">Pseudonymous case ID<input name="patient_id" required maxlength="120" value="${escape(cohortItem?.patient_id||'')}" ${cohortItem?'readonly':''} placeholder="e.g. DEMO-012"></label>${cohortItem?`<input type="hidden" name="cohort_item_id" value="${cohortItem.id}"><p class="small-note">Linked to ${escape(cohortItem.external_id)} / ${escape(cohortItem.visit||'unspecified visit')}. Import exactly one matching series.</p>`:''}<div id="drop-zone" class="drop-zone">Drop DICOM files, a folder, ZIP, or one NIfTI volume<label>Choose files<input id="upload-files" type="file" multiple></label><label>Choose folder<input id="upload-folder" type="file" multiple webkitdirectory></label><p id="file-count">No files selected</p></div><label class="form-label"><span><input name="deidentified" type="checkbox" required> These are de-identified images approved for this demo.</span></label><p class="small-note">256 MB upload limit. Oversized or oblique volumes are rejected rather than silently altered. Patient identifiers are not automatically removed.</p><button id="upload-submit" class="primary">Import</button></form>`);
- let files=[];function selected(list){files=[...list];$('file-count').textContent=`${files.length} files selected`;}
- for(const id of ['upload-files','upload-folder'])$(id).onchange=event=>selected(event.target.files);
- const zone=$('drop-zone');zone.ondragover=event=>event.preventDefault();zone.ondrop=action(async event=>{event.preventDefault();const {collectDirectoryEntries}=await import('/import-files.mjs');const items=[...event.dataTransfer.items];const entries=items.map(item=>item.webkitGetAsEntry?.()).filter(Boolean);if(entries.length){const result=await collectDirectoryEntries(entries);selected(result.map(item=>item.file));}else selected(event.dataTransfer.files);});
- $('import-form').onsubmit=action(async event=>{event.preventDefault();if(!files.length)throw new Error('Select images first.');const data=new FormData(event.target);for(const file of files)data.append('files',file,file.webkitRelativePath||file.name);$('upload-submit').disabled=true;$('upload-submit').textContent='Importing...';try{await api('/api/import',data);$('modal').close();state.tab='worklist';await refresh();toast('Images imported.');}finally{if($('upload-submit')){$('upload-submit').disabled=false;$('upload-submit').textContent='Import';}}});
+async function assignReader(caseId){state.users=await api('/api/users');showModal('Assigner un lecteur',`<form id="assign-form"><label class="form-label">Lecteur<select name="reader">${state.users.map(u=>`<option value="${u.id}">${escape(u.name)} / ${escape(roleName(u.role))}</option>`).join('')}</select></label><button class="primary">Assigner</button></form>`);$('assign-form').onsubmit=action(async event=>{event.preventDefault();await api(`/api/cases/${caseId}/assign`,{user_id:new FormData(event.target).get('reader')});$('modal').close();await refresh();toast('Lecteur assigné.');});}
+function addUser(){showModal('Créer un radiologue',`<form id="user-form"><label class="form-label">Nom<input name="name" required maxlength="120"></label><label class="form-label">Identifiant<input name="username" required pattern="[a-z0-9][a-z0-9._-]{2,79}" autocomplete="off"></label><label class="form-label">Mot de passe temporaire<input name="password" type="password" required minlength="12" autocomplete="new-password"></label><label class="form-label">Rôle<select name="role"><option value="reviewer" selected>Radiologue</option><option value="junior_annotator">Annotateur</option><option value="senior_annotator">Annotateur senior</option><option value="admin">Administrateur</option></select></label><p class="small-note">Le compte voit les cohortes ouvertes. Transmettez le mot de passe en privé.</p><button class="primary">Créer le compte</button></form>`);$('user-form').onsubmit=action(async event=>{event.preventDefault();await api('/api/users',Object.fromEntries(new FormData(event.target)));$('modal').close();await renderAdmin();toast('Compte créé.');});}
+function importImages(cohortItem=null, projectId=''){
+  const cohorts=cohortProjects();
+  if(!cohorts.length) return toast('Ouvrez d’abord un dataset.', true);
+  const selected=projectId||state.project||cohorts[0].id;
+  showModal('Importer des images',`<form id="import-form"><label class="form-label">Cohorte<select name="project_id">${projectOptions(false, selected)}</select></label><label class="form-label">Identifiant d’examen<input name="patient_id" required maxlength="120" value="${escape(cohortItem?.patient_id||'')}" ${cohortItem?'readonly':''} placeholder="ex. COHORTE-012"></label>${cohortItem?`<input type="hidden" name="cohort_item_id" value="${cohortItem.id}">`:''}<div id="drop-zone" class="drop-zone">Déposez des fichiers DICOM, un dossier, une archive ZIP ou un volume NIfTI<label>Choisir des fichiers<input id="upload-files" type="file" multiple></label><label>Choisir un dossier<input id="upload-folder" type="file" multiple webkitdirectory></label><p id="file-count">Aucun fichier</p></div><label class="form-label"><span><input name="deidentified" type="checkbox" required> Ces images sont dé-identifiées et autorisées pour cette cohorte.</span></label><p class="small-note">Limite 256 Mo. Les volumes trop grands ou obliques sont refusés. Les identifiants patient ne sont pas retirés automatiquement.</p><button id="upload-submit" class="primary">Importer</button></form>`);
+  let files=[];function selectedFiles(list){files=[...list];$('file-count').textContent=`${files.length} fichier${files.length>1?'s':''}`;}
+  for(const id of ['upload-files','upload-folder'])$(id).onchange=event=>selectedFiles(event.target.files);
+  const zone=$('drop-zone');zone.ondragover=event=>event.preventDefault();zone.ondrop=action(async event=>{event.preventDefault();const {collectDirectoryEntries}=await import('/import-files.mjs');const entries=[...event.dataTransfer.items].map(item=>item.webkitGetAsEntry?.()).filter(Boolean);if(entries.length){const result=await collectDirectoryEntries(entries);selectedFiles(result.map(item=>item.file));}else selectedFiles(event.dataTransfer.files);});
+  $('import-form').onsubmit=action(async event=>{event.preventDefault();if(!files.length)throw new Error('Sélectionnez des images.');const data=new FormData(event.target);for(const file of files)data.append('files',file,file.webkitRelativePath||file.name);$('upload-submit').disabled=true;$('upload-submit').textContent='Import…';try{await api('/api/import',data);$('modal').close();await refresh();toast('Images importées.');}finally{if($('upload-submit')){$('upload-submit').disabled=false;$('upload-submit').textContent='Importer';}}});
 }
 
-const runExtraction=featureFileDialog({state,api,escape,showModal,refresh,action});
 const platform=platformWorkspace({state,api,escape,showModal,action,toast,refresh,importImages});
 
-function compareReadings(){const rows=state.data.assignments.filter(a=>['completed','approved'].includes(a.status));if(rows.length<2)return toast('Two submitted readings of the same examination are required.');const options=rows.map(row=>`<option value="${row.id}">${escape(row.patient_id)} / ${escape(row.reader)}</option>`).join('');showModal('Compare submitted readings',`<form id="compare-form"><label class="form-label">Reading A<select name="a">${options}</select></label><label class="form-label">Reading B<select name="b">${options}</select></label><button class="primary">Compare masks</button><div id="comparison-result"></div></form>`);$('compare-form').onsubmit=action(async event=>{event.preventDefault();const data=await api('/api/review/compare',Object.fromEntries(new FormData(event.target)));$('comparison-result').innerHTML=`<div class="metrics" style="margin-top:20px;grid-template-columns:1fr 1fr"><div class="metric"><span>Union-mask Dice</span><strong>${data.dice.toFixed(3)}</strong></div><div class="metric"><span>Volume difference</span><strong>${data.volume_difference_ml.toFixed(2)}<small>mL, A minus B</small></strong></div></div><p class="small-note">${escape(data.notice)}</p>`;});}
-
 $('content').addEventListener('click',action(async event=>{
- const button=event.target.closest('button');if(!button)return;
- if(button.dataset.project){state.project=button.dataset.project;state.status='';state.query='';return showTab('worklist');}
- if(button.dataset.begin){const row=await api(`/api/cases/${button.dataset.begin}/assign`,{});await refresh(false);return openAssignment(row.id);}
- if(button.dataset.open)return openAssignment(button.dataset.open);
- if(button.dataset.assign)return assignReader(button.dataset.assign);
- if(button.dataset.extract)return runExtraction(button.dataset.extract);
-
- if(button.dataset.source){const source=state.data.cases.find(c=>c.id===button.dataset.source).source;return showModal('Dataset provenance',`<p><a href="${escape(source.source_url||'https://medicaldecathlon.com/')}" target="_blank" rel="noopener">${escape(source.source)}</a></p><p>${escape(source.license)}</p><p class="small-note">${escape(source.citation||'')}</p><pre class="protocol">${escape(JSON.stringify(source,null,2))}</pre>`);}
- if(button.dataset.adjudicate){const row=await api(`/api/assignments/${button.dataset.adjudicate}/adjudicate`,{});await refresh(false);return openAssignment(row.id);}
- if(button.dataset.approve){const row=state.data.assignments.find(a=>a.id===button.dataset.approve);showModal('Approve this revision?',`<form id="approve-form"><p>${escape(row.patient_id)} / ${escape(row.reader)} / revision ${row.revision_id.slice(0,8)}</p><label class="form-label"><span><input type="checkbox" required> I inspected the lesion masks across the relevant planes.</span></label><button class="primary">Approve revision</button></form>`);$('approve-form').onsubmit=action(async e=>{e.preventDefault();await api(`/api/lung/studies/${row.id}/approve`,{version:row.version,revision_id:row.revision_id,reviewed:true});$('modal').close();await refresh();toast('Revision approved.');});return;}
- if(button.dataset.return){const row=state.data.assignments.find(a=>a.id===button.dataset.return);showModal('Return for revision',`<form id="return-form"><label class="form-label">Required changes<input name="comment" required maxlength="1000"></label><button class="primary">Return to annotator</button></form>`);$('return-form').onsubmit=action(async e=>{e.preventDefault();await api(`/api/assignments/${row.id}/return`,{version:row.version,comment:new FormData(e.target).get('comment')});$('modal').close();await refresh();});return;}
- const actions={import:importImages,'add-user':addUser,compare:compareReadings};if(actions[button.dataset.action])return actions[button.dataset.action]();
+  const button=event.target.closest('button');if(!button||button.dataset.platformAction)return;
+  if(button.dataset.project){state.project=button.dataset.project;state.status='';state.query='';return showTab('review');}
+  if(button.dataset.importProject)return importImages(null, button.dataset.importProject);
+  if(button.dataset.begin){const row=await api(`/api/cases/${button.dataset.begin}/assign`,{});await refresh(false);return openAssignment(row.id);}
+  if(button.dataset.open)return openAssignment(button.dataset.open);
+  if(button.dataset.assign)return assignReader(button.dataset.assign);
+  if(button.dataset.adjudicate){const row=await api(`/api/assignments/${button.dataset.adjudicate}/adjudicate`,{});await refresh(false);return openAssignment(row.id);}
+  if(button.dataset.approve){const row=state.data.assignments.find(a=>a.id===button.dataset.approve);showModal('Approuver cette lecture ?',`<form id="approve-form"><p>${escape(row.patient_id)} / ${escape(row.reader)}</p><label class="form-label"><span><input type="checkbox" required> J’ai revu le masque sur les coupes concernées.</span></label><button class="primary">Approuver</button></form>`);$('approve-form').onsubmit=action(async e=>{e.preventDefault();await api(`/api/lung/studies/${row.id}/approve`,{version:row.version,revision_id:row.revision_id,reviewed:true});$('modal').close();await refresh();toast('Lecture approuvée.');});return;}
+  if(button.dataset.return){const row=state.data.assignments.find(a=>a.id===button.dataset.return);showModal('Renvoyer au radiologue',`<form id="return-form"><label class="form-label">Corrections demandées<input name="comment" required maxlength="1000"></label><button class="primary">Renvoyer</button></form>`);$('return-form').onsubmit=action(async e=>{e.preventDefault();await api(`/api/assignments/${row.id}/return`,{version:row.version,comment:new FormData(e.target).get('comment')});$('modal').close();await refresh();toast('Lecture renvoyée.');});return;}
+  const actions={'add-user':addUser};if(actions[button.dataset.action])return actions[button.dataset.action]();
 }));
 $('navigation').addEventListener('click',action(async event=>{const button=event.target.closest('[data-tab]');if(button){if(button.dataset.tab!=='annotation')await refresh(false);await showTab(button.dataset.tab);}}));
 $('modal-close').onclick=()=>$('modal').close();
-$('back-worklist').onclick=action(async()=>{await refresh(false);await showTab('worklist');});
+$('back-worklist').onclick=action(async()=>{await refresh(false);await showTab('review');});
 $('refresh-assignment').onclick=action(async()=>{await refresh(false);await openAssignment(state.assignment.id);});
-$('reference-load').onclick=action(async()=>{const meta=await api(`/api/lung/studies/${state.assignment.id}`);await api(`/api/assignments/${state.assignment.id}/reference`,{version:meta.version});await refresh(false);await openAssignment(state.assignment.id);toast('Public reference imported as a practice draft. This is not an AI prediction.');});
-$('feature-export').onclick=action(()=>runExtraction(state.assignment.id));
-$('assignment-guidelines').onclick=()=>showModal(`Annotation guidelines / version ${state.assignment.project_version||'legacy'}`,`<p class="small-note">Instructions recorded when this reading was created.</p><div class="guideline-copy">${escape(state.assignment.guidelines||'No guideline snapshot was stored for this legacy reading. Ask the project administrator before proceeding.')}</div>`);
-window.addEventListener('message',action(async event=>{if(event.origin!==location.origin||event.source!==$('viewer').contentWindow||event.data?.type!=='oncometra:annotation-updated')return;await refresh(false);const row=state.data.assignments.find(a=>a.id===event.data.studyId);if(row&&row.id===state.assignment?.id){state.assignment=row;$('feature-export').hidden=row.status!=='approved';}}));
+$('assignment-guidelines').onclick=()=>showModal(`Protocole / version ${state.assignment.project_version||'—'}`,`<div class="guideline-copy">${escape(state.assignment.guidelines||'Aucun protocole enregistré pour cette lecture.')}</div>`);
+window.addEventListener('message',action(async event=>{if(event.origin!==location.origin||event.source!==$('viewer').contentWindow||event.data?.type!=='oncometra:annotation-updated')return;await refresh(false);const row=state.data.assignments.find(a=>a.id===event.data.studyId);if(row&&row.id===state.assignment?.id)state.assignment=row;}));
 $('logout').onclick=action(async()=>{await api('/api/auth/logout',{});$('viewer').src='about:blank';showLogin();});
 $('login-form').onsubmit=async event=>{event.preventDefault();$('login-error').textContent='';try{state.user=await api('/api/auth/login',Object.fromEntries(new FormData(event.target)));event.target.reset();await boot();}catch(error){$('login-error').textContent=error.message;}};
-async function boot(){state.user=await api('/api/auth/me');$('login-screen').hidden=true;$('workspace').hidden=false;$('user-name').textContent=state.user.name;$('user-role').textContent=state.user.role==='admin'?'Reviewer / Administrator':state.user.role.replaceAll('_',' ');document.querySelectorAll('[data-admin]').forEach(el=>el.hidden=state.user.role!=='admin');document.querySelectorAll('[data-review]').forEach(el=>el.hidden=!reviewAccess());await refresh();}
+async function boot(){
+  state.user=await api('/api/auth/me');
+  $('login-screen').hidden=true;$('workspace').hidden=false;
+  $('user-name').textContent=state.user.name;
+  $('user-role').textContent=roleName(state.user.role);
+  $('user-avatar').textContent=state.user.name.split(/\s+/).filter(Boolean).map(part=>part[0]).join('').slice(0,2).toUpperCase()||'U';
+  document.querySelectorAll('[data-admin]').forEach(el=>el.hidden=state.user.role!=='admin');
+  if(state.user.role==='admin'){if(!['datasets','cohorts','review','admin','annotation'].includes(state.tab))state.tab='datasets';}
+  else if(!['cohorts','review','annotation'].includes(state.tab))state.tab='cohorts';
+  await refresh();
+}
 boot().catch(error=>{showLogin();if(error.message!=='Sign in to continue')$('login-error').textContent=error.message;});

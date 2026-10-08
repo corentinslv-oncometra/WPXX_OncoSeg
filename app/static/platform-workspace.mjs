@@ -1,6 +1,8 @@
 export function platformWorkspace({state, api, escape, showModal, action, toast, refresh, importImages}) {
   const $ = id => document.getElementById(id);
-  const catalog = {page: 1, query: '', modality: '', items: []};
+  const catalog = {page: 1, query: '', modality: '', scope: 'eligible', items: []};
+  const useLabel = {unknown: 'licence inconnue', permitted: 'usage commercial permis', noncommercial: 'non commercial', permission_required: 'permission requise'};
+  const accessText = {unknown: 'accès inconnu', direct: 'accès ouvert', login: 'connexion requise', account: 'compte requis', request: 'permission requise'};
   let poll;
   function scheduleRefresh() {
     poll = setTimeout(() => {
@@ -18,24 +20,23 @@ export function platformWorkspace({state, api, escape, showModal, action, toast,
 
   async function renderDatasets() {
     clearTimeout(poll);
-    const result = await api(`/api/catalog?page=${catalog.page}&q=${encodeURIComponent(catalog.query)}&modality=${catalog.modality}`);
+    const result = await api(`/api/catalog?page=${catalog.page}&q=${encodeURIComponent(catalog.query)}&modality=${catalog.modality}&scope=${catalog.scope}`);
     catalog.items = result.items;
-    const jobs = await api('/api/catalog-jobs');
     if (state.tab !== 'datasets') return;
-    $('content').innerHTML = `<div class="page-heading"><div><h1>Datasets</h1><p>Source discovery, access review and cohort preparation</p></div><div class="actions"><button data-platform-action="oncoradar-sync">Sync OncoRadar index</button><button data-platform-action="catalog-import">Import OncoRadar catalog</button><button class="primary" data-platform-action="dataset-new">Add dataset</button></div></div>
-      <section class="catalog-intake"><div><strong>Prepare a cohort</strong><p>Identify a source, review its terms, link a project, then import a series manifest and images.</p></div><div class="actions"><button data-platform-action="discover" data-registry="TCIA">Discover TCIA</button><button data-platform-action="discover" data-registry="IDC">Discover IDC</button></div></section>
-      <section class="table-panel"><form id="catalog-search" class="filters"><input name="q" aria-label="Find dataset" placeholder="Find dataset by name" value="${escape(catalog.query)}"><select name="modality" aria-label="Imaging modality">${options([['', 'All modalities'], ['CT', 'CT'], ['MR', 'MRI']], catalog.modality)}</select><button>Search</button><span class="small-note">${result.total} datasets</span></form>
-      <div class="table-scroll"><table><thead><tr><th>Dataset / source</th><th>Cancer / imaging</th><th>Access / use</th><th>Follow-up / masks</th><th>Status</th><th></th></tr></thead><tbody>${result.items.map(row => `<tr><td><strong><a href="${escape(row.url)}" target="_blank" rel="noopener noreferrer">${escape(row.name)}</a></strong><small>${escape(row.registry)}</small>${[row.profile?.domain, row.profile?.sub, row.profile?.trial, row.profile?.patient_count != null ? row.profile.patient_count + ' patients' : '', row.dicom_path ? 'DICOM folder set' : ''].filter(Boolean).length ? `<small>${escape([row.profile?.domain, row.profile?.sub, row.profile?.trial, row.profile?.patient_count != null ? row.profile.patient_count + ' patients' : '', row.dicom_path ? 'DICOM folder set' : ''].filter(Boolean).join(' · '))}</small>` : ''}</td><td>${escape(row.tumor_types.join(', ') || 'Unclassified')}<small>${escape(row.modalities.join(', ') || 'Modality unverified')}</small></td><td>${escape(row.access.replaceAll('_', ' '))}<small>${escape(row.license_name)} / ${escape(row.commercial_use.replaceAll('_', ' '))}</small></td><td>Follow-up: ${tri(row.longitudinal)}<small>Segmentations: ${tri(row.segmentations)}</small></td><td><span class="status">${escape(row.status.replaceAll('_', ' '))}</span></td><td><div class="row-actions"><button data-platform-action="dataset-edit" data-id="${row.id}">Details</button><button data-platform-action="cohort" data-id="${row.id}">Prepare cohort</button>${row.dicom_path && row.indexed_patients ? `<button data-platform-action="totalseg" data-id="${row.id}">${row.totalseg_status === 'running' ? 'TotalSegmentator running' : 'TotalSegmentator stats'}</button>` : ''}</div></td></tr>`).join('')}</tbody></table></div>
-      ${result.items.length ? '' : '<div class="empty"><h2>No matching datasets</h2><p>Discover public sources or import an existing catalog. Discovery retrieves metadata, not scans.</p></div>'}
-      <div class="catalog-pagination"><button data-platform-action="previous" ${catalog.page === 1 ? 'disabled' : ''}>Previous</button><span>Page ${catalog.page} of ${Math.max(1, Math.ceil(result.total / 50))}</span><button data-platform-action="next" ${catalog.page * 50 >= result.total ? 'disabled' : ''}>Next</button></div></section>
-      <p class="small-note">Access and commercial-use permissions are separate. Unknown means unverified, not absent or permitted. Download status is curator-declared; a metadata manifest does not make images available for annotation.</p>
-      <section class="panel"><div class="section-label"><h2>Discovery jobs</h2><button data-platform-action="refresh">Refresh</button></div>${jobs.length ? jobs.slice(0, 5).map(job => `<div class="catalog-job"><strong>${job.registry}</strong><span class="status ${job.status}">${job.status}</span><span>${escape(job.error || (job.result ? `${job.result.created} new / ${job.result.refreshed} refreshed` : 'Waiting for catalog worker'))}</span></div>`).join('') : '<p>No discovery jobs requested. Existing catalog entries are retained on refresh or source failure.</p>'}</section>`;
+    const empty = catalog.scope === 'eligible'
+      ? '<div class="empty"><h2>Aucune fiche ouverte avec usage commercial permis</h2><p>Passez le filtre sur toutes les fiches pour voir le reste : licence inconnue, non commerciale, ou permission requise.</p></div>'
+      : '<div class="empty"><h2>Aucune fiche</h2><p>Aucune fiche du catalogue ne correspond à cette recherche.</p></div>';
+    $('content').innerHTML = `<div class="page-heading"><div><h1>Datasets exploitables</h1><p>Fiches OncoRadar ouvertes, avec un usage commercial permis. Le reste du catalogue est derrière le filtre.</p></div></div>
+      <section class="table-panel"><form id="catalog-search" class="filters"><input name="q" aria-label="Chercher une fiche" placeholder="Chercher une fiche" value="${escape(catalog.query)}"><select name="modality" aria-label="Modalité">${options([['', 'Toutes les modalités'], ['CT', 'CT'], ['MR', 'IRM']], catalog.modality)}</select><select name="scope" aria-label="Filtre de licence">${options([['eligible', 'Usage commercial permis, accès ouvert'], ['all', 'Toutes les fiches']], catalog.scope)}</select><button>Filtrer</button><span class="small-note">${result.total} fiches</span></form>
+      <div class="table-scroll"><table><thead><tr><th>Dataset</th><th>Cancer / imagerie</th><th>Accès / licence</th><th></th></tr></thead><tbody>${result.items.map(row => `<tr><td><strong><a href="${escape(row.url)}" target="_blank" rel="noopener noreferrer">${escape(row.name)}</a></strong><small>${escape(row.registry)}</small></td><td>${escape(row.tumor_types.join(', ') || 'Non précisé')}<small>${escape(row.modalities.join(', ') || 'Modalité non vérifiée')}</small></td><td>${escape(accessText[row.access] || row.access)}<small>${escape(row.license_name)} / ${escape(useLabel[row.commercial_use] || row.commercial_use)}</small></td><td><div class="row-actions"><button class="primary" data-platform-action="use-dataset" data-id="${row.id}">Utiliser ce dataset</button></div></td></tr>`).join('')}</tbody></table></div>
+      ${result.items.length ? '' : empty}
+      <div class="catalog-pagination"><button data-platform-action="previous" ${catalog.page === 1 ? 'disabled' : ''}>Précédent</button><span>Page ${catalog.page} / ${Math.max(1, Math.ceil(result.total / 50))}</span><button data-platform-action="next" ${catalog.page * 50 >= result.total ? 'disabled' : ''}>Suivant</button></div></section>
+      <p class="small-note">La première page ne montre que les fiches en accès ouvert dont l’usage commercial est permis. Unknown, non commercial et permission requise restent accessibles via le filtre.</p>`;
     $('catalog-search').onsubmit = action(async event => {
       event.preventDefault(); const data = new FormData(event.target);
-      catalog.query = data.get('q'); catalog.modality = data.get('modality'); catalog.page = 1;
+      catalog.query = data.get('q'); catalog.modality = data.get('modality'); catalog.scope = data.get('scope') || 'eligible'; catalog.page = 1;
       await renderDatasets();
     });
-    if (jobs.some(job => ['queued', 'running'].includes(job.status))) scheduleRefresh();
   }
 
   const ACCESS_LABELS = ['Direct download', 'Login required', 'Account required', 'Request access'];
@@ -295,6 +296,14 @@ export function platformWorkspace({state, api, escape, showModal, action, toast,
     const command = button.dataset.platformAction;
     const row = catalog.items.find(item => item.id === button.dataset.id);
     const project = state.data.projects.find(item => item.id === button.dataset.id);
+    if (command === 'use-dataset') {
+      const result = await api(`/api/catalog/${button.dataset.id}/use`, {});
+      const missing = result.gaps.length ? result.gaps.join(', ') : 'rien à signaler';
+      state.tab = 'cohorts';
+      await refresh();
+      toast(result.created ? `Cohorte créée. Encore : ${missing}.` : `Cohorte déjà ouverte. Encore : ${missing}.`);
+      return;
+    }
     if (command === 'dataset-new') return editDataset();
     if (command === 'dataset-edit') return editDataset(row);
     if (command === 'cohort') return showCohort(row);

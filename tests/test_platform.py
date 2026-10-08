@@ -390,6 +390,35 @@ def test_dicom_import_checks_manifest_identity_and_preserves_source(clients, tmp
                 assert (image_directory(case) / 'original-dicom.zip').exists()
 
 
+def test_eligible_catalog_opens_one_cohort_and_reports_gaps(clients):
+    admin, reader, _reviewer = clients
+    hidden = add_dataset(admin)
+    opened = admin.post('/api/catalog', json=dataset_request(
+        external_id='OPEN-COMMERCIAL', name='Open commercial source', commercial_use='permitted', access='direct')).json()
+    gated = admin.post('/api/catalog', json=dataset_request(
+        external_id='PERMITTED-GATED', name='Permitted but gated', commercial_use='permitted', access='request')).json()
+    eligible = [item['id'] for item in admin.get('/api/catalog?scope=eligible').json()['items']]
+    assert opened['id'] in eligible
+    assert hidden['id'] not in eligible and gated['id'] not in eligible
+    assert reader.post(f'/api/catalog/{opened["id"]}/use').status_code == 403
+    first = admin.post(f'/api/catalog/{opened["id"]}/use')
+    assert first.status_code == 201, first.text
+    body = first.json()
+    assert body['created'] is True
+    assert body['gaps'] == ['images non importées', 'pas de masque']
+    second = admin.post(f'/api/catalog/{opened["id"]}/use')
+    assert second.status_code == 200
+    assert second.json()['created'] is False and second.json()['project_id'] == body['project_id']
+    unclear = admin.post(f'/api/catalog/{hidden["id"]}/use')
+    assert unclear.status_code == 201
+    assert 'licence non tranchée' in unclear.json()['gaps']
+    visible = reader.get('/api/workspace').json()['projects']
+    cohort = next(item for item in visible if item['id'] == body['project_id'])
+    assert cohort['dataset']['commercial_use'] == 'permitted'
+    organ = next(item for item in admin.get('/api/workspace').json()['projects'] if item['id'] == 'lung-ct')
+    assert 'dataset' not in organ
+
+
 def test_discovery_keeps_unknown_fields_and_rejects_unexpected_payload(monkeypatch):
     import httpx
     from app import catalog_connectors

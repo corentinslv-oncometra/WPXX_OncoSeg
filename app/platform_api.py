@@ -270,6 +270,7 @@ def build_router(current_user, require_admin, require_project, audit):
 
     @router.get("/catalog")
     def catalog(q: str = "", modality: Literal["", "CT", "MR"] = "", status: str = "",
+                scope: Literal["", "eligible", "all"] = "",
                 page: int = Query(1, ge=1), user=Depends(current_user)):
         require_admin(user)
         with SessionLocal() as db:
@@ -278,6 +279,8 @@ def build_router(current_user, require_admin, require_project, audit):
                 query = query.where(CatalogDataset.name.ilike("%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%", escape="\\"))
             if status:
                 query = query.where(CatalogDataset.status == status)
+            if scope == "eligible":
+                query = query.where(CatalogDataset.commercial_use == "permitted", CatalogDataset.access == "direct")
             # Portable JSON containment is implemented after a bounded metadata selection.
             if modality:
                 from sqlalchemy import cast, String
@@ -285,6 +288,54 @@ def build_router(current_user, require_admin, require_project, audit):
             total = db.scalar(select(func.count()).select_from(query.subquery()))
             rows = list(db.scalars(query.order_by(CatalogDataset.name).offset((page - 1) * 50).limit(50)))
             return {"items": [dataset_payload(row) for row in rows], "total": total, "page": page, "page_size": 50}
+
+    @router.post("/catalog/{dataset_id}/use")
+    def use_dataset(dataset_id: UUID, user=Depends(current_user)):
+        require_admin(user)
+        with SessionLocal() as db:
+            dataset = db.get(CatalogDataset, str(dataset_id))
+            if not dataset:
+                raise HTTPException(404, "Dataset not found")
+            project = None
+            for link in db.scalars(select(ProjectDataset).where(ProjectDataset.dataset_id == dataset.id)):
+                project = db.get(WorkspaceProject, link.project_id)
+                if project:
+                    break
+            created = project is None
+            if created:
+                modalities = [str(item).upper() for item in (dataset.modalities or [])]
+                modality = "CT" if "CT" in modalities or "MR" not in modalities else "MR"
+                name = (dataset.name or "Cohorte").strip()[:120] or "Cohorte"
+                if len(name) < 2:
+                    name = "Cohorte"
+                origin = (", ".join(dataset.tumor_types or []) or name)[:120]
+                if len(origin) < 2:
+                    origin = "Cohorte"
+                project = WorkspaceProject(
+                    id=str(uuid4()), name=name, cancer_origin=origin, modality=modality, target=name[:300],
+                    guidelines="Annoter les lésions visibles sur les séries importées. Corriger la proposition du modèle lorsqu'elle existe, sinon dessiner le masque.",
+                    lesion_sites=[], color="#0a5ad4")
+                db.add(project)
+                db.flush()
+                db.add(ProjectDataset(project_id=project.id, dataset_id=dataset.id))
+                audit(db, user, "dataset_opened_as_cohort", project.id, {"dataset_id": dataset.id})
+            for account in db.scalars(select(WorkspaceUser)):
+                if account.role == "admin":
+                    continue
+                previous = list(account.projects or [])
+                if project.id not in previous:
+                    db.execute(update(WorkspaceUser).where(WorkspaceUser.id == account.id).values(projects=previous + [project.id]))
+            case_count = db.scalar(select(func.count()).select_from(WorkspaceCase).where(WorkspaceCase.project_id == project.id)) or 0
+            gaps = []
+            if dataset.commercial_use != "permitted":
+                gaps.append("licence non tranchée")
+            if not case_count:
+                gaps.append("images non importées")
+            if dataset.segmentations is not True:
+                gaps.append("pas de masque")
+            db.commit()
+            return JSONResponse({"project_id": project.id, "name": project.name, "created": created, "gaps": gaps},
+                                status_code=201 if created else 200)
 
     @router.post("/catalog", status_code=201)
     def create_dataset(req: DatasetInput, user=Depends(current_user)):

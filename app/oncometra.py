@@ -37,7 +37,7 @@ from app.models import (
     AnnotationTaskEvent, LungSegmentationJob,
 )
 from app.oncometra_models import WorkspaceUser, WorkspaceSession, WorkspaceCase, WorkspaceAssignment, WorkspaceFeatureJob, WorkspaceAudit
-from app.oncometra_models import WorkspaceProject, CaseSourceLink
+from app.oncometra_models import WorkspaceProject, CaseSourceLink, ProjectDataset, CatalogDataset
 from app.platform_services import seed_projects, visible_projects, project_payload, prepare_import_link
 from app import lung_api as lung
 from app.services.annotation_review import annotation_db, latest_task_event, task_status, actor_for
@@ -437,11 +437,18 @@ def overview(user=Depends(current_user)):
         assignments = list(db.scalars(select(WorkspaceAssignment).where(WorkspaceAssignment.case_id.in_([case.id for case in cases]))))
         visible = assignments if can_review(user) else [a for a in assignments if a.user_id == user.id]
         rows = [assignment_payload(db, assignment) for assignment in visible]
+        project_ids = [stored.id for stored in available_projects]
+        links = {row.project_id: row.dataset_id for row in db.scalars(select(ProjectDataset).where(ProjectDataset.project_id.in_(project_ids)))} if project_ids else {}
+        linked = {row.id: row for row in db.scalars(select(CatalogDataset).where(CatalogDataset.id.in_(set(links.values()))))} if links else {}
         projects = []
         for stored_project in available_projects:
             project = project_payload(stored_project)
             project_cases = [case for case in cases if case.project_id == project["id"]]
             project_rows = [row for row in rows if row["project_id"] == project["id"]]
+            dataset = linked.get(links.get(project["id"]))
+            if dataset:
+                project["dataset"] = {"id": dataset.id, "name": dataset.name, "commercial_use": dataset.commercial_use,
+                    "access": dataset.access, "segmentations": dataset.segmentations, "license_name": dataset.license_name}
             projects.append({**project, "cases": len(project_cases), "assignments": len(project_rows),
                 "completed": len({r["case_id"] for r in project_rows if r["status"] in ("completed", "approved")}),
                 "approved": len({r["case_id"] for r in project_rows if r["status"] == "approved"}),
@@ -451,7 +458,7 @@ def overview(user=Depends(current_user)):
             "cases": [{"id": c.id, "project_id": c.project_id, "patient_id": c.patient_id,
                        "modality": c.modality, "source": c.source} for c in cases],
             "storage": "ephemeral" if os.getenv("DEMO_EPHEMERAL", "false") == "true" else "persistent",
-            "notice": "Demonstration only. Public de-identified data. Export work before a free-service restart.",
+            "notice": "Public de-identified cohorts. Not a clinical decision system.",
             "counts_scope": "Visible assignments. Lesion counts are reader observations, not adjudicated unique tumors."}
 
 
@@ -757,6 +764,8 @@ def add_user(req: NewUser, user=Depends(current_user)):
         if db.scalar(select(WorkspaceUser).where(WorkspaceUser.username == req.username)):
             raise HTTPException(409, "Username already exists")
         project_ids = PROJECT_IDS if req.projects is None else list(dict.fromkeys(req.projects))
+        if req.projects is None:
+            project_ids = list(dict.fromkeys([*project_ids, *db.scalars(select(ProjectDataset.project_id).distinct())]))
         if any(not db.get(WorkspaceProject, project_id) for project_id in project_ids):
             raise HTTPException(422, "Unknown project")
         created = WorkspaceUser(username=req.username, name=req.name, password_hash=password_hash(req.password), role=req.role, projects=project_ids)

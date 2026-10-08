@@ -24,9 +24,9 @@
     "semantic_hash": ""
   },
   "app/lung_api.py": {
-    "mtime": 1790712990.7556183,
-    "seen": 1791450050.9717107,
-    "ast_hash": "620cadd2cb301747dd1dc79754ab2699",
+    "mtime": 1791452971.9381206,
+    "seen": 1791453130.2572002,
+    "ast_hash": "25c8fb88653ac5561eb441fc0d4ae4a5",
     "semantic_hash": ""
   },
   "app/main.py": {
@@ -42,9 +42,9 @@
     "semantic_hash": ""
   },
   "app/oncometra.py": {
-    "mtime": 1791449962.4578485,
-    "seen": 1791450050.9717138,
-    "ast_hash": "7eab30185161b9e655faed56f850d201",
+    "mtime": 1791452954.947534,
+    "seen": 1791453130.257205,
+    "ast_hash": "cedda4e5dd590d4bf4154b1a50e24045",
     "semantic_hash": ""
   },
   "app/oncometra_models.py": {
@@ -125,24 +125,6 @@
     "ast_hash": "f7b55ea650e7fcbb844e7e096d4e7bf2",
     "semantic_hash": ""
   },
-  "app/services/medsam_jobs.py": {
-    "mtime": 1790671623.4918542,
-    "seen": 1791450050.9717278,
-    "ast_hash": "a6131ef0419df871741773009c6b9826",
-    "semantic_hash": ""
-  },
-  "app/services/medsam_runtime.py": {
-    "mtime": 1790671623.4928641,
-    "seen": 1791450050.9717295,
-    "ast_hash": "23f9985bd4e933998b5a76cab448f8e6",
-    "semantic_hash": ""
-  },
-  "app/services/medsam_worker.py": {
-    "mtime": 1790712990.7576177,
-    "seen": 1791450050.9717305,
-    "ast_hash": "0dc5165f882e9188f0620fb374ae2767",
-    "semantic_hash": ""
-  },
   "app/services/model_catalog.py": {
     "mtime": 1790671623.4938624,
     "seen": 1791450050.9717314,
@@ -192,15 +174,15 @@
     "semantic_hash": ""
   },
   "app/static/annotate.js": {
-    "mtime": 1790671623.5028653,
-    "seen": 1791450050.9717393,
-    "ast_hash": "d0d64d953fc321037747b1cfd5c51003",
+    "mtime": 1791453031.6316242,
+    "seen": 1791453130.2572339,
+    "ast_hash": "bfaa661eb80a0aa93d50a8459a9fc551",
     "semantic_hash": ""
   },
   "app/static/annotation-workflow.mjs": {
-    "mtime": 1790671623.503884,
-    "seen": 1791450050.9717405,
-    "ast_hash": "b89656286c38d35c4d09bdf25129fc23",
+    "mtime": 1791452984.6131608,
+    "seen": 1791453130.2572353,
+    "ast_hash": "e57ea2264b41eeece750b3044d567e88",
     "semantic_hash": ""
   },
   "app/static/app.js": {
@@ -234,9 +216,9 @@
     "semantic_hash": ""
   },
   "app/static/oncometra.js": {
-    "mtime": 1791449935.4867368,
-    "seen": 1791450050.9717462,
-    "ast_hash": "d20fe51c67ce7c32d9916fbddf4e6078",
+    "mtime": 1791452973.8317287,
+    "seen": 1791453130.257243,
+    "ast_hash": "87407e8c4b5367545bb95b933009a93f",
     "semantic_hash": ""
   },
   "app/static/platform-workspace.mjs": {
@@ -281,28 +263,10 @@
     "ast_hash": "db73ea414a25514787293c0c6e417277",
     "semantic_hash": ""
   },
-  "docs/litemedsam-technical-smoke.json": {
-    "mtime": 1790671623.9705315,
-    "seen": 1791450050.9717548,
-    "ast_hash": "8a5427a553eadf5a0f635be83bdb9c34",
-    "semantic_hash": ""
-  },
-  "model-assets/litemedsam/manifest.json": {
-    "mtime": 1790671624.485523,
-    "seen": 1791450050.9717557,
-    "ast_hash": "a941b3a3f0478cd91de437e66ac9d340",
-    "semantic_hash": ""
-  },
   "scripts/demo_admin.py": {
     "mtime": 1790712990.8853807,
     "seen": 1791450050.9717572,
     "ast_hash": "4ead7848185bdd89cf891f683a038b68",
-    "semantic_hash": ""
-  },
-  "scripts/export_litemedsam.py": {
-    "mtime": 1790671624.5036132,
-    "seen": 1791450050.9717581,
-    "ast_hash": "d71a2a073b929ad4158d7fa73488b8a5",
     "semantic_hash": ""
   },
   "scripts/export_oncoradar_catalog.py": {
@@ -323,28 +287,10 @@
     "ast_hash": "d54245c088dfb93fe4edba103bd21c51",
     "semantic_hash": ""
   },
-  "scripts/smoke_deployment.py": {
-    "mtime": 1790671624.5089338,
-    "seen": 1791450050.9717622,
-    "ast_hash": "ba92881f0fe84979af5ceb47a3ca3ffe",
-    "semantic_hash": ""
-  },
-  "scripts/smoke_medsam.py": {
-    "mtime": 1790671624.5099337,
-    "seen": 1791450050.971763,
-    "ast_hash": "ae5d6e860b5bdbac609bab396faaa47e",
-    "semantic_hash": ""
-  },
-  "tests/test_medsam_runtime.py": {
-    "mtime": 1790671624.5109339,
-    "seen": 1791450050.9717638,
-    "ast_hash": "192fb68518610ac1c7fde97c57ea0da6",
-    "semantic_hash": ""
-  },
   "tests/test_oncometra.py": {
-    "mtime": 1791449979.1111329,
-    "seen": 1791450050.971765,
-    "ast_hash": "22fd5a199a7e5094c155878fefa55fa8",
+    "mtime": 1791453042.8319528,
+    "seen": 1791453130.2572582,
+    "ast_hash": "626915fcba66aa7979d750595cb70b34",
     "semantic_hash": ""
   },
   "tests/test_platform.py": {
@@ -366,9 +312,9 @@
     "semantic_hash": ""
   },
   "app/static/annotate.html": {
-    "mtime": 1790671623.500865,
-    "seen": 1791450050.9717689,
-    "ast_hash": "cfeded47b4c6095b0d4addd17ed2d811",
+    "mtime": 1791452988.1335616,
+    "seen": 1791453130.2572632,
+    "ast_hash": "56562e5846e350900c326b31ba490633",
     "semantic_hash": ""
   },
   "app/static/index.html": {
@@ -378,9 +324,9 @@
     "semantic_hash": ""
   },
   "app/static/oncometra.html": {
-    "mtime": 1791447526.6295595,
-    "seen": 1791450050.9717708,
-    "ast_hash": "f2d65deb0a26f9be314fc9cf405171e6",
+    "mtime": 1791452971.93938,
+    "seen": 1791453130.2572656,
+    "ast_hash": "781cc9b9de75c0cafbd25d1a69493d0d",
     "semantic_hash": ""
   },
   "demo-cases/README.md": {
@@ -402,15 +348,15 @@
     "semantic_hash": ""
   },
   "docs/oncometra-demo.md": {
-    "mtime": 1791288711.9509785,
-    "seen": 1791450050.971775,
-    "ast_hash": "4c1f2a6217e94f44afddf81b2d38f2dd",
+    "mtime": 1791453046.0493622,
+    "seen": 1791453130.2572703,
+    "ast_hash": "8198f31a4503b082544d46b6a844c241",
     "semantic_hash": ""
   },
   "docs/oncoradar-integration.md": {
-    "mtime": 1790712990.920389,
-    "seen": 1791450050.971776,
-    "ast_hash": "7a77a77afc7894cfe44517f1471659b2",
+    "mtime": 1791453052.4006631,
+    "seen": 1791453130.2572718,
+    "ast_hash": "7602822c4673596bf9c76c9f38e5696c",
     "semantic_hash": ""
   },
   "docs/unified-workspace.md": {
@@ -420,9 +366,9 @@
     "semantic_hash": ""
   },
   "requirements-demo.txt": {
-    "mtime": 1791288711.9509785,
-    "seen": 1791450050.9717777,
-    "ast_hash": "6e6de6b920a55a9b9d6e55eba9e5f056",
+    "mtime": 1791452974.2323737,
+    "seen": 1791453130.2572744,
+    "ast_hash": "a9f3752b1fe6e20403fa455326648f38",
     "semantic_hash": ""
   },
   "requirements.txt": {
