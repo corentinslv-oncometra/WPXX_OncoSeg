@@ -1,42 +1,116 @@
 export function platformWorkspace({state, api, escape, showModal, action, toast, refresh, importImages}) {
   const $ = id => document.getElementById(id);
-  const catalog = {page: 1, query: '', modality: '', scope: 'eligible', items: []};
+  const catalog = {page: 1, query: '', modality: '', commercial_use: 'permitted', access: 'direct', registry: '', masks: '', followup: '', images: '', license: '', filtersOpen: false, items: []};
+  const registries = ['IDC', 'TCIA', 'Grand Challenge', 'GDC', 'OpenNeuro', 'ISIC Archive', 'Hugging Face', 'Zenodo', 'MSD', 'HTAN'];
   const useLabel = {unknown: 'licence inconnue', permitted: 'usage commercial permis', noncommercial: 'non commercial', permission_required: 'permission requise'};
   const accessText = {unknown: 'accès inconnu', direct: 'accès ouvert', login: 'connexion requise', account: 'compte requis', request: 'permission requise'};
   let poll;
   function scheduleRefresh() {
     poll = setTimeout(() => {
       if (state.tab !== 'datasets') return;
-      if ($('modal').open || document.activeElement?.closest('#catalog-search')) return scheduleRefresh();
+      if ($('modal').open || document.activeElement?.closest('#dataset-search, #catalog-filters')) return scheduleRefresh();
       action(renderDatasets)();
     }, 4000);
   }
+  const FILTER_FIELDS = [
+    {name: 'commercial_use', label: 'Usage commercial', choices: [['permitted', 'Usage commercial permis'], ['noncommercial', 'Non commercial'], ['permission_required', 'Permission requise'], ['unknown', 'Licence inconnue'], ['', 'Tous les usages']]},
+    {name: 'access', label: 'Accès', choices: [['direct', 'Accès ouvert'], ['account', 'Compte requis'], ['login', 'Connexion requise'], ['request', 'Demande d’accès'], ['unknown', 'Accès inconnu'], ['', 'Tous les accès']]},
+    {name: 'registry', label: 'Source', choices: [['', 'Toutes les sources'], ...registries.map(name => [name, name])]},
+    {name: 'modality', label: 'Modalité', choices: [['', 'Toutes les modalités'], ['CT', 'CT'], ['MR', 'IRM']]},
+    {name: 'masks', label: 'Masques', choices: [['', 'Tous les masques'], ['yes', 'Avec masque'], ['no', 'Sans masque'], ['unknown', 'Masque non précisé']]},
+    {name: 'followup', label: 'Suivi', choices: [['', 'Tout suivi'], ['yes', 'Avec suivi'], ['no', 'Sans suivi'], ['unknown', 'Suivi non précisé']]},
+    {name: 'license', label: 'Licence', choices: [['', 'Toutes les licences'], ['named', 'Licence renseignée'], ['unverified', 'Licence non vérifiée']]},
+    {name: 'images', label: 'Images', choices: [['', 'Toutes les images'], ['ready', 'Dossier DICOM'], ['missing', 'Sans images importées']]},
+  ];
+  const FILTER_ICON = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 5h16l-6.2 7.4V19l-3.6 1.6v-8.2L4 5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>';
+  let searchTimer;
   const options = (values, selected = '') => values.map(([value, label]) => `<option value="${escape(value)}" ${value === selected ? 'selected' : ''}>${escape(label)}</option>`).join('');
+  const catalogRequest = () => {
+    const params = new URLSearchParams({page: catalog.page, q: catalog.query});
+    for (const field of FILTER_FIELDS) params.set(field.name, catalog[field.name] || '');
+    return `/api/catalog?${params}`;
+  };
+  const activeFilterCount = () => FILTER_FIELDS.filter(field => catalog[field.name]).length;
+  const setFiltersOpen = open => {
+    catalog.filtersOpen = open;
+    const panel = $('catalog-filters');
+    const button = $('filter-toggle');
+    if (!panel || !button) return;
+    panel.hidden = !open;
+    button.setAttribute('aria-expanded', open ? 'true' : 'false');
+  };
+  document.addEventListener('click', event => {
+    const anchor = $('filter-anchor');
+    if (catalog.filtersOpen && anchor && !anchor.contains(event.target)) setFiltersOpen(false);
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') setFiltersOpen(false);
+  });
   const yesNo = value => options([['', 'Unknown'], ['true', 'Yes'], ['false', 'No']], value == null ? '' : String(value));
   const split = value => value.split(',').map(s => s.trim()).filter(Boolean);
   const field = (label, name, value = '', extra = '') => `<label class="form-label">${label}<input name="${name}" value="${escape(value)}" ${extra}></label>`;
   const tri = value => value == null ? 'Unknown' : value ? 'Yes' : 'No';
   const projectOptions = () => state.data.projects.map(p => `<option value="${p.id}">${escape(p.name)} / ${p.modality}</option>`).join('');
 
+  function datasetRows(items) {
+    if (!items.length) return '<div class="empty"><h2>Aucune fiche</h2><p>Aucune fiche ne correspond à cette recherche.</p></div>';
+    const patients = row => {
+      const value = row.profile?.patient_count;
+      const number = Number(value);
+      return Number.isFinite(number) && value !== '' && value != null ? number.toLocaleString('fr-FR') : '—';
+    };
+    const rows = items.map(row => `<tr><td><strong><a href="${escape(row.url)}" target="_blank" rel="noopener noreferrer">${escape(row.name)}</a></strong><small>${escape(row.registry)}</small></td><td>${escape(row.tumor_types.join(', ') || 'Non précisé')}<small>${escape(row.modalities.join(', ') || 'Modalité non vérifiée')}</small></td><td class="patient-count">${patients(row)}</td><td>${escape(accessText[row.access] || row.access)}<small>${escape(row.license_name)} / ${escape(useLabel[row.commercial_use] || row.commercial_use)}</small></td><td><div class="row-actions"><button class="primary" data-platform-action="use-dataset" data-id="${row.id}">Utiliser ce dataset</button></div></td></tr>`).join('');
+    return `<div class="table-scroll"><table><thead><tr><th>Dataset</th><th>Cancer / imagerie</th><th>Patients</th><th>Accès / licence</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }
+  function paintDatasets(result) {
+    const pages = Math.max(1, Math.ceil(result.total / 50));
+    const count = activeFilterCount();
+    $('dataset-count').textContent = `${result.total} fiches`;
+    $('dataset-rows').innerHTML = datasetRows(result.items);
+    $('catalog-page').textContent = `Page ${catalog.page} / ${pages}`;
+    $('catalog-previous').disabled = catalog.page === 1;
+    $('catalog-next').disabled = catalog.page * 50 >= result.total;
+    $('filter-count').hidden = count === 0;
+    $('filter-count').textContent = String(count);
+  }
+  function mountDatasets(result) {
+    const fields = FILTER_FIELDS.map(field => `<label class="filter-field">${escape(field.label)}<select name="${field.name}">${options(field.choices, catalog[field.name])}</select></label>`).join('');
+    $('content').innerHTML = `<div class="page-heading"><div><h1>Datasets exploitables</h1><p>La première vue montre les fiches ouvertes dont l’usage commercial est permis.</p></div><div class="actions"><button data-platform-action="oncoradar-sync">Actualiser depuis OncoRadar</button></div></div>
+      <div class="catalog-toolbar"><input id="dataset-search" class="catalog-search" type="search" placeholder="Rechercher un dataset" aria-label="Rechercher un dataset" value="${escape(catalog.query)}" autocomplete="off"><div class="filter-anchor" id="filter-anchor"><button type="button" id="filter-toggle" class="filter-toggle" aria-haspopup="dialog" aria-expanded="${catalog.filtersOpen ? 'true' : 'false'}" aria-controls="catalog-filters" aria-label="Filtres">${FILTER_ICON}<span id="filter-count" class="filter-count"></span></button><form id="catalog-filters" class="filter-popover" ${catalog.filtersOpen ? '' : 'hidden'}><div class="filter-popover-head">Filtres</div><div class="filter-popover-body">${fields}</div></form></div></div>
+      <section class="table-panel"><div id="dataset-rows"></div>
+      <div class="catalog-pagination"><button type="button" id="catalog-previous" data-platform-action="previous">Précédent</button><span id="catalog-page"></span><span id="dataset-count" class="small-note"></span><button type="button" id="catalog-next" data-platform-action="next">Suivant</button></div></section>
+      <p class="small-note">Les filtres se cumulent. « Tous » retire cette contrainte.</p>`;
+    $('dataset-search').addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(action(async () => {
+        const input = $('dataset-search');
+        if (!input || state.tab !== 'datasets') return;
+        catalog.query = input.value.trim();
+        catalog.page = 1;
+        await renderDatasets();
+      }), 250);
+    });
+    $('catalog-filters').addEventListener('change', action(async () => {
+      const data = new FormData($('catalog-filters'));
+      for (const field of FILTER_FIELDS) catalog[field.name] = data.get(field.name) || '';
+      catalog.page = 1;
+      await renderDatasets();
+    }));
+    $('catalog-filters').addEventListener('submit', event => event.preventDefault());
+    $('filter-toggle').addEventListener('click', event => {
+      event.stopPropagation();
+      setFiltersOpen(!catalog.filtersOpen);
+    });
+    paintDatasets(result);
+  }
+
   async function renderDatasets() {
     clearTimeout(poll);
-    const result = await api(`/api/catalog?page=${catalog.page}&q=${encodeURIComponent(catalog.query)}&modality=${catalog.modality}&scope=${catalog.scope}`);
+    const result = await api(catalogRequest());
     catalog.items = result.items;
     if (state.tab !== 'datasets') return;
-    const empty = catalog.scope === 'eligible'
-      ? '<div class="empty"><h2>Aucune fiche ouverte avec usage commercial permis</h2><p>Passez le filtre sur toutes les fiches pour voir le reste : licence inconnue, non commerciale, ou permission requise.</p></div>'
-      : '<div class="empty"><h2>Aucune fiche</h2><p>Aucune fiche du catalogue ne correspond à cette recherche.</p></div>';
-    $('content').innerHTML = `<div class="page-heading"><div><h1>Datasets exploitables</h1><p>Fiches OncoRadar ouvertes, avec un usage commercial permis. Le reste du catalogue est derrière le filtre.</p></div></div>
-      <section class="table-panel"><form id="catalog-search" class="filters"><input name="q" aria-label="Chercher une fiche" placeholder="Chercher une fiche" value="${escape(catalog.query)}"><select name="modality" aria-label="Modalité">${options([['', 'Toutes les modalités'], ['CT', 'CT'], ['MR', 'IRM']], catalog.modality)}</select><select name="scope" aria-label="Filtre de licence">${options([['eligible', 'Usage commercial permis, accès ouvert'], ['all', 'Toutes les fiches']], catalog.scope)}</select><button>Filtrer</button><span class="small-note">${result.total} fiches</span></form>
-      <div class="table-scroll"><table><thead><tr><th>Dataset</th><th>Cancer / imagerie</th><th>Accès / licence</th><th></th></tr></thead><tbody>${result.items.map(row => `<tr><td><strong><a href="${escape(row.url)}" target="_blank" rel="noopener noreferrer">${escape(row.name)}</a></strong><small>${escape(row.registry)}</small></td><td>${escape(row.tumor_types.join(', ') || 'Non précisé')}<small>${escape(row.modalities.join(', ') || 'Modalité non vérifiée')}</small></td><td>${escape(accessText[row.access] || row.access)}<small>${escape(row.license_name)} / ${escape(useLabel[row.commercial_use] || row.commercial_use)}</small></td><td><div class="row-actions"><button class="primary" data-platform-action="use-dataset" data-id="${row.id}">Utiliser ce dataset</button></div></td></tr>`).join('')}</tbody></table></div>
-      ${result.items.length ? '' : empty}
-      <div class="catalog-pagination"><button data-platform-action="previous" ${catalog.page === 1 ? 'disabled' : ''}>Précédent</button><span>Page ${catalog.page} / ${Math.max(1, Math.ceil(result.total / 50))}</span><button data-platform-action="next" ${catalog.page * 50 >= result.total ? 'disabled' : ''}>Suivant</button></div></section>
-      <p class="small-note">La première page ne montre que les fiches en accès ouvert dont l’usage commercial est permis. Unknown, non commercial et permission requise restent accessibles via le filtre.</p>`;
-    $('catalog-search').onsubmit = action(async event => {
-      event.preventDefault(); const data = new FormData(event.target);
-      catalog.query = data.get('q'); catalog.modality = data.get('modality'); catalog.scope = data.get('scope') || 'eligible'; catalog.page = 1;
-      await renderDatasets();
-    });
+    if ($('dataset-search')) paintDatasets(result);
+    else mountDatasets(result);
   }
 
   const ACCESS_LABELS = ['Direct download', 'Login required', 'Account required', 'Request access'];
@@ -216,13 +290,13 @@ export function platformWorkspace({state, api, escape, showModal, action, toast,
   }
 
   function syncOncoRadar() {
-    showModal('Sync OncoRadar index', `<form id="oncoradar-sync"><label class="form-label">WP05 SQLite file<input name="database" required value="C:\\Users\\coren\\MonDrive\\WP05_OncoRadar\\data\\oncoradar.sqlite"></label><p class="small-note">Reads the WP05 database in place. Copies each dataset record, including trial, site, histology, access, license, download path, and clinical-file summaries. The patient list stays in WP05. Curated notes in this workspace are kept.</p><button class="primary">Sync index</button></form>`);
+    showModal('Actualiser depuis OncoRadar', `<form id="oncoradar-sync"><label class="form-label">Base OncoRadar<input name="database" required value="C:\\Users\\coren\\MonDrive\\WP05_OncoRadar\\data\\oncoradar.sqlite"></label><p class="small-note">Lecture seule de la base OncoRadar. Copie la fiche, l’accès, la licence et l’usage commercial. Les images et la liste des patients restent dans OncoRadar. Une valeur déjà revue ici n’est pas écrasée.</p><button class="primary">Actualiser</button></form>`);
     $('oncoradar-sync').onsubmit = action(async event => {
       event.preventDefault();
       const result = await api('/api/oncoradar-sync', {database: new FormData(event.target).get('database')});
       $('modal').close();
       await renderDatasets();
-      toast(`${result.created} datasets added, ${result.refreshed} refreshed. Patient lists were not copied.`);
+      toast(`${result.datasets} fiches lues. ${result.created} ajoutées, ${result.refreshed} mises à jour. Les images restent dans OncoRadar.`);
     });
   }
 

@@ -42,9 +42,9 @@
     "semantic_hash": ""
   },
   "app/oncometra.py": {
-    "mtime": 1791452954.947534,
-    "seen": 1791453130.257205,
-    "ast_hash": "cedda4e5dd590d4bf4154b1a50e24045",
+    "mtime": 1791460194.2345662,
+    "seen": 1791460538.3445642,
+    "ast_hash": "5d882b568dd7036d4845532e6531019e",
     "semantic_hash": ""
   },
   "app/oncometra_models.py": {
@@ -60,9 +60,9 @@
     "semantic_hash": ""
   },
   "app/platform_api.py": {
-    "mtime": 1791447526.6350055,
-    "seen": 1791450050.971717,
-    "ast_hash": "961557e9ee16c76e19dfb4dbadf761e8",
+    "mtime": 1791462996.1674826,
+    "seen": 1791463083.551694,
+    "ast_hash": "fe9ca31066eb659f1ad5670af2a8d691",
     "semantic_hash": ""
   },
   "app/platform_services.py": {
@@ -216,15 +216,15 @@
     "semantic_hash": ""
   },
   "app/static/oncometra.js": {
-    "mtime": 1791452973.8317287,
-    "seen": 1791453130.257243,
-    "ast_hash": "87407e8c4b5367545bb95b933009a93f",
+    "mtime": 1791465294.232176,
+    "seen": 1791465348.6754253,
+    "ast_hash": "a17c7dde9f9ed2ba786797882dff9d47",
     "semantic_hash": ""
   },
   "app/static/platform-workspace.mjs": {
-    "mtime": 1791447526.6364152,
-    "seen": 1791450050.9717474,
-    "ast_hash": "0d175ea07473a514a547dbb8d3fe279e",
+    "mtime": 1791465328.0811718,
+    "seen": 1791465348.675427,
+    "ast_hash": "a84607d6f0e2063b4717631ab95bfd06",
     "semantic_hash": ""
   },
   "app/static/viewer-controls.mjs": {
@@ -294,9 +294,9 @@
     "semantic_hash": ""
   },
   "tests/test_platform.py": {
-    "mtime": 1791447526.628296,
-    "seen": 1791450050.971766,
-    "ast_hash": "8b443ea059f93803a443dda1231adbb3",
+    "mtime": 1791463009.048601,
+    "seen": 1791463083.5518625,
+    "ast_hash": "4ba196c9cec558b1c34eee1d900bbfef",
     "semantic_hash": ""
   },
   "tests/viewer-fullscreen.test.mjs": {
@@ -324,9 +324,9 @@
     "semantic_hash": ""
   },
   "app/static/oncometra.html": {
-    "mtime": 1791452971.93938,
-    "seen": 1791453130.2572656,
-    "ast_hash": "781cc9b9de75c0cafbd25d1a69493d0d",
+    "mtime": 1791465293.9231327,
+    "seen": 1791465348.6754532,
+    "ast_hash": "b6c15d4fd07653d08c4fdb26614c3be9",
     "semantic_hash": ""
   },
   "demo-cases/README.md": {

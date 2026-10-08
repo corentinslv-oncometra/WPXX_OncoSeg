@@ -137,6 +137,66 @@ def job_payload(row):
             "created_at": row.created_at.isoformat()}
 
 
+_ACCESS_CODE = {"Direct download": "direct", "Login required": "login", "Account required": "account", "Request access": "request"}
+_REGISTRY_OPEN = {
+    "IDC": "Direct download", "TCIA": "Account required", "OpenNeuro": "Account required",
+    "ISIC Archive": "Account required", "Zenodo": "Direct download", "MSD": "Direct download",
+    "Hugging Face": "Direct download", "Grand Challenge": "Account required", "GDC": "Request access",
+    "HTAN": "Request access",
+}
+_REGISTRY_MIXED = {
+    "TCIA": "Request access", "GDC": "Request access", "HTAN": "Request access",
+    "Hugging Face": "Request access", "IDC": "Request access", "ISIC Archive": "Account required",
+    "OpenNeuro": "Account required", "Zenodo": "Direct download",
+}
+
+
+def oncoradar_access(value, registry=""):
+    """Same download labels as OncoRadar. An open TCIA collection still needs an account."""
+    text = str(value or "").strip()
+    if text in _ACCESS_CODE:
+        return _ACCESS_CODE[text]
+    lowered = text.lower()
+    wording = [
+        (("direct download", "download directly", "downloadable", "publicly available", "open access", "freely available"), "Direct download"),
+        (("login", "log in", "sign in", "credentials", "authentication"), "Login required"),
+        (("account", "register", "create an account", "signup", "sign up"), "Account required"),
+        (("request access", "access request", "apply", "approval", "email", "contact", "by request"), "Request access"),
+    ]
+    label = next((name for tokens, name in wording if any(token in lowered for token in tokens)), "")
+    if not label:
+        folded = " ".join(text.replace("\u00a0", " ").replace("–", "-").replace("—", "-").replace("·", " ").replace(".", " ").lower().split())
+        if "gated" in folded or "restricted" in folded:
+            label = "Request access"
+        elif "mixed" in folded:
+            label = _REGISTRY_MIXED.get(registry, "Request access")
+        elif folded in {"open", "mostly open"} or folded.startswith("open "):
+            label = _REGISTRY_OPEN.get(registry, "")
+    return _ACCESS_CODE.get(label, "unknown")
+
+
+def oncoradar_commercial(raw):
+    """Copy OncoRadar's Allowed / Not allowed. An empty cell stays unknown."""
+    text = str(raw.get("commercial_use") or raw.get("commercial") or "").strip().lower().replace("_", " ").replace("-", " ")
+    if text in {"allowed", "permitted"}:
+        return "permitted"
+    if text in {"not allowed", "noncommercial", "non commercial"}:
+        return "noncommercial"
+    if text in {"permission required"}:
+        return "permission_required"
+    return "unknown"
+
+
+def apply_imported_rights(row, fields):
+    """Fill rights that were never reviewed. A curator value is left as stored."""
+    if row.commercial_use == "unknown" and fields["commercial_use"] != "unknown":
+        row.commercial_use = fields["commercial_use"]
+    if row.license_name in ("", "Unverified") and fields["license_name"] not in ("", "Unverified"):
+        row.license_name = fields["license_name"]
+    if row.access == "unknown" and fields["access"] != "unknown":
+        row.access = fields["access"]
+
+
 def normalize_oncoradar(raw):
     source = str(raw.get("registry") or "OncoRadar")
     name = str(raw.get("name") or "")
@@ -152,19 +212,16 @@ def normalize_oncoradar(raw):
         tumor = [tumor]
     # OncoRadar stores a free-text description here, not a short label.
     tumor = list(dict.fromkeys(" ".join(str(item).split())[:120] for item in tumor if str(item).strip()))[:40]
-    access = {"Direct download": "direct", "Login required": "login", "Account required": "account",
-              "Request access": "request"}.get(raw.get("access"), raw.get("access", "unknown"))
-    if access not in {"direct", "login", "account", "request"}:
-        access = "unknown"
     segmentation_count = raw.get("seg")
     has_segmentations = (raw.get("segmentations") is True or
         isinstance(segmentation_count, int) and segmentation_count > 0)
+    license_name = str(raw.get("license_name") or raw.get("license") or "Unverified").strip()[:255] or "Unverified"
     # OncoRadar's false booleans also mean "not established". Do not turn them into verified negatives.
     return DatasetInput.model_validate({"registry": source, "external_id": str(raw.get("external_id") or raw.get("id") or name),
         "name": name, "url": url, "tumor_types": tumor,
         "modalities": sorted({"MR" if str(v).upper() == "MRI" else str(v).upper() for v in modalities} & {"CT", "MR"}),
-        "access": access, "license_name": raw.get("license_name") or "Unverified",
-        "license_url": raw.get("license_url") or "", "commercial_use": raw.get("commercial_use") or "unknown",
+        "access": oncoradar_access(raw.get("access"), source), "license_name": license_name,
+        "license_url": raw.get("license_url") or "", "commercial_use": oncoradar_commercial(raw),
         "longitudinal": True if raw.get("longitudinal") in (True, 1) else None,
         "segmentations": True if has_segmentations else None,
         "notes": notes, "evidence": raw.get("evidence") or []}).model_dump()
@@ -194,6 +251,7 @@ def build_router(current_user, require_admin, require_project, audit):
                     row, was_created = upsert_discovery(db, fields)
                     created += was_created
                     patients += apply_imaging_index(db, row, raw)
+                    apply_imported_rights(row, fields)
             except (ValueError, TypeError) as error:
                 db.rollback()
                 raise HTTPException(422, str(error)) from error
@@ -271,6 +329,13 @@ def build_router(current_user, require_admin, require_project, audit):
     @router.get("/catalog")
     def catalog(q: str = "", modality: Literal["", "CT", "MR"] = "", status: str = "",
                 scope: Literal["", "eligible", "all"] = "",
+                commercial_use: Literal["", "permitted", "noncommercial", "permission_required", "unknown"] = "",
+                access: Literal["", "direct", "login", "account", "request", "unknown"] = "",
+                registry: str = Query("", max_length=80),
+                masks: Literal["", "yes", "no", "unknown"] = "",
+                followup: Literal["", "yes", "no", "unknown"] = "",
+                images: Literal["", "ready", "missing"] = "",
+                license: Literal["", "named", "unverified"] = "",
                 page: int = Query(1, ge=1), user=Depends(current_user)):
         require_admin(user)
         with SessionLocal() as db:
@@ -281,6 +346,32 @@ def build_router(current_user, require_admin, require_project, audit):
                 query = query.where(CatalogDataset.status == status)
             if scope == "eligible":
                 query = query.where(CatalogDataset.commercial_use == "permitted", CatalogDataset.access == "direct")
+            if commercial_use:
+                query = query.where(CatalogDataset.commercial_use == commercial_use)
+            if access:
+                query = query.where(CatalogDataset.access == access)
+            if registry:
+                query = query.where(CatalogDataset.registry == registry)
+            if masks == "yes":
+                query = query.where(CatalogDataset.segmentations.is_(True))
+            elif masks == "no":
+                query = query.where(CatalogDataset.segmentations.is_(False))
+            elif masks == "unknown":
+                query = query.where(CatalogDataset.segmentations.is_(None))
+            if followup == "yes":
+                query = query.where(CatalogDataset.longitudinal.is_(True))
+            elif followup == "no":
+                query = query.where(CatalogDataset.longitudinal.is_(False))
+            elif followup == "unknown":
+                query = query.where(CatalogDataset.longitudinal.is_(None))
+            if images == "ready":
+                query = query.where(CatalogDataset.dicom_ready.is_(True))
+            elif images == "missing":
+                query = query.where(CatalogDataset.dicom_ready.is_(False))
+            if license == "named":
+                query = query.where(CatalogDataset.license_name.notin_(["", "Unverified"]))
+            elif license == "unverified":
+                query = query.where(CatalogDataset.license_name.in_(["", "Unverified"]))
             # Portable JSON containment is implemented after a bounded metadata selection.
             if modality:
                 from sqlalchemy import cast, String
@@ -382,6 +473,7 @@ def build_router(current_user, require_admin, require_project, audit):
                     row, was_created = upsert_discovery(db, fields)
                     created += was_created
                     patients += apply_imaging_index(db, row, raw)
+                    apply_imported_rights(row, fields)
             except (ValueError, TypeError) as error:
                 db.rollback()
                 raise HTTPException(422, str(error)) from error

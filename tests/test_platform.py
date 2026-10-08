@@ -236,6 +236,12 @@ def test_imported_unverified_flags_are_not_treated_as_positive():
     assert len(shortened["tumor_types"]) == 1
     assert len(shortened["tumor_types"][0]) == 120
     assert shortened["tumor_types"][0].startswith("The ACROBAT challenge")
+    assert normalize_oncoradar({**dataset_request(), "commercial": "Allowed", "license": "CC BY"})["commercial_use"] == "permitted"
+    assert normalize_oncoradar({**dataset_request(), "commercial": "Not allowed"})["commercial_use"] == "noncommercial"
+    assert normalize_oncoradar({**dataset_request(), "commercial": ""})["commercial_use"] == "unknown"
+    assert normalize_oncoradar({**dataset_request(), "registry": "TCIA", "access": "Open · some restricted"})["access"] == "request"
+    assert normalize_oncoradar({**dataset_request(), "registry": "IDC", "access": "Open"})["access"] == "direct"
+    assert normalize_oncoradar({**dataset_request(), "registry": "TCIA", "access": "Open"})["access"] == "account"
 
 
 def test_oncoradar_sync_copies_dicom_path_and_patient_index(clients, tmp_path):
@@ -277,6 +283,9 @@ def test_oncoradar_sync_copies_dicom_path_and_patient_index(clients, tmp_path):
     assert catalog["profile"]["patient_count"] == 211
     assert catalog["profile"]["license"] == "CC BY 4.0"
     assert catalog["profile"]["commercial"] == "noncommercial"
+    assert catalog["commercial_use"] == "noncommercial"
+    assert catalog["license_name"] == "CC BY 4.0"
+    assert catalog["access"] == "direct"
     assert catalog["profile"]["modalities"] == ["CT"]
     assert catalog["profile"]["access"] == "Direct download"
     assert catalog["profile"]["longitudinal"] == 1
@@ -291,7 +300,7 @@ def test_oncoradar_sync_copies_dicom_path_and_patient_index(clients, tmp_path):
     index = admin.get(f"/api/catalog/{catalog['id']}/patient-index").json()
     assert index["total"] == 0
     fields = {k: v for k, v in catalog.items() if k not in {"id", "registry", "external_id", "last_seen_at", "dicom_ready", "dicom_path", "indexed_patients", "tumor_detail", "profile", "totalseg_status", "totalseg_detail", "totalseg_error"}}
-    fields.update(notes="Curated by data team")
+    fields.update(notes="Curated by data team", commercial_use="permission_required")
     assert admin.put(f"/api/catalog/{catalog['id']}", json=fields).status_code == 200
     with sqlite3.connect(database) as db:
         db.execute("UPDATE datasets SET hist = 'Squamous' WHERE id = 'NSCLC'")
@@ -302,6 +311,7 @@ def test_oncoradar_sync_copies_dicom_path_and_patient_index(clients, tmp_path):
     assert again.json()["created"] == 0 and again.json()["patients"] == 0
     kept = admin.get("/api/catalog?q=NSCLC").json()["items"][0]
     assert kept["notes"] == "Curated by data team"
+    assert kept["commercial_use"] == "permission_required"
     assert kept["profile"]["hist"] == "Squamous"
     assert admin.get(f"/api/catalog/{kept['id']}/patient-index").json()["total"] == 0
     metadata_only = {**dataset_request(), "registry": "TCIA", "external_id": "NSCLC", "name": "NSCLC radiogenomics", "url": "https://example.org/nsclc"}
@@ -400,6 +410,9 @@ def test_eligible_catalog_opens_one_cohort_and_reports_gaps(clients):
     eligible = [item['id'] for item in admin.get('/api/catalog?scope=eligible').json()['items']]
     assert opened['id'] in eligible
     assert hidden['id'] not in eligible and gated['id'] not in eligible
+    stacked = [item['id'] for item in admin.get('/api/catalog?commercial_use=permitted&access=direct&registry=Test').json()['items']]
+    assert opened['id'] in stacked and gated['id'] not in stacked and hidden['id'] not in stacked
+    assert admin.get('/api/catalog?commercial_use=unknown&masks=unknown&q=Synthetic').json()['total'] >= 1
     assert reader.post(f'/api/catalog/{opened["id"]}/use').status_code == 403
     first = admin.post(f'/api/catalog/{opened["id"]}/use')
     assert first.status_code == 201, first.text

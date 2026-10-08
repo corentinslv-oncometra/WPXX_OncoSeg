@@ -60,9 +60,9 @@
     "semantic_hash": ""
   },
   "app/platform_api.py": {
-    "mtime": 1791460188.9343672,
-    "seen": 1791460538.3445683,
-    "ast_hash": "2f9a69539c5210d1e52791d96f88de93",
+    "mtime": 1791462996.1674826,
+    "seen": 1791463083.551694,
+    "ast_hash": "fe9ca31066eb659f1ad5670af2a8d691",
     "semantic_hash": ""
   },
   "app/platform_services.py": {
@@ -216,15 +216,15 @@
     "semantic_hash": ""
   },
   "app/static/oncometra.js": {
-    "mtime": 1791460480.2355082,
-    "seen": 1791460538.3446014,
-    "ast_hash": "9d259f70511fe4e476277b1f930c7eca",
+    "mtime": 1791469025.7553966,
+    "seen": 1791469051.9253724,
+    "ast_hash": "ce936d6a6ca305741c4d9e108e0923b5",
     "semantic_hash": ""
   },
   "app/static/platform-workspace.mjs": {
-    "mtime": 1791460474.6746733,
-    "seen": 1791460538.3446026,
-    "ast_hash": "2aaeefe4e257ac5a70bd37bad55c0f28",
+    "mtime": 1791469024.5851445,
+    "seen": 1791469051.9253783,
+    "ast_hash": "77ce16d6c1201cdeefef1a98b601bf06",
     "semantic_hash": ""
   },
   "app/static/viewer-controls.mjs": {
@@ -294,9 +294,9 @@
     "semantic_hash": ""
   },
   "tests/test_platform.py": {
-    "mtime": 1791460332.0172877,
-    "seen": 1791460538.3446167,
-    "ast_hash": "944d420e9daae16ba77b59f135a09e44",
+    "mtime": 1791463009.048601,
+    "seen": 1791463083.5518625,
+    "ast_hash": "4ba196c9cec558b1c34eee1d900bbfef",
     "semantic_hash": ""
   },
   "tests/viewer-fullscreen.test.mjs": {
@@ -324,9 +324,9 @@
     "semantic_hash": ""
   },
   "app/static/oncometra.html": {
-    "mtime": 1791460479.9310553,
-    "seen": 1791460538.3446226,
-    "ast_hash": "e825f01b47549b0826c2f2dc0344961a",
+    "mtime": 1791469025.7142243,
+    "seen": 1791469051.9254668,
+    "ast_hash": "af2257af789505e106f55e6a3d7b26eb",
     "semantic_hash": ""
   },
   "demo-cases/README.md": {

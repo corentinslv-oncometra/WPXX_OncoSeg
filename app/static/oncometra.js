@@ -1,4 +1,4 @@
-import {platformWorkspace} from '/assets/platform-workspace.mjs?v=cohorts-2';
+import {platformWorkspace} from '/assets/platform-workspace.mjs?v=cohorts-9';
 const $ = id => document.getElementById(id);
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const roleName = value => ({admin:'Administrateur', reviewer:'Radiologue', junior_annotator:'Annotateur', senior_annotator:'Annotateur senior'}[value] || value);

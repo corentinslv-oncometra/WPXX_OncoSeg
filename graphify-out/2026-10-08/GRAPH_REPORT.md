@@ -1,17 +1,17 @@
 # Graph Report - WPXX_OncoSeg  (2026-10-08)
 
 ## Corpus Check
-- 58 files · ~52,472 words
+- 58 files · ~53,601 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 17 file(s) not represented in the graph (top: .gz 10, .css 4, (none) 2)
 
 ## Summary
-- 922 nodes · 2904 edges · 47 communities (31 shown, 16 thin omitted)
-- Extraction: 93% EXTRACTED · 7% INFERRED · 0% AMBIGUOUS · INFERRED: 197 edges (avg confidence: 0.92)
+- 935 nodes · 2934 edges · 37 communities (24 shown, 13 thin omitted)
+- Extraction: 93% EXTRACTED · 7% INFERRED · 0% AMBIGUOUS · INFERRED: 199 edges (avg confidence: 0.92)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `3a0e71f1`
+- Built from commit: `dcc4ae3a`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -19,28 +19,20 @@
 - test_platform.py
 - lung_api.py
 - WorkflowService
-- simpleitk
 - app.js
 - annotate.js
 - totalseg_stats.py
 - oncometra.py
 - oncometra.js
-- get
-- imaging.py
-- build_router
-- main.py
-- platform_services.py
 - platform_api.py
+- main.py
 - ViewerFullscreen
-- radiomics.py
-- bulk_upload_dicom_folder
+- RadiomicsModel
 - platformWorkspace
 - StudyStore
 - AI-Native Cloud PACS/RIS Blueprint
-- feature_protocol.py
 - Oncometra Imaging Workspace
-- seed_demo
-- SpeechToTextNotConfigured
+- os
 - MVP Scaffold
 - Recommended Platform Decomposition
 - static/import-files.mjs
@@ -49,23 +41,21 @@
 - README.md
 - OncoRadar integration decisions
 - Running the unified workspace
-- integrations.py
 - nodule-controls.mjs
 - MVP Build Sequence
 - not_found_handler
 - annotation-workflow.mjs
 - Local Hosting And Deployment Modes
-- Segmenter
 
 ## God Nodes (most connected - your core abstractions)
 1. `WorkflowService` - 47 edges
-2. `build_router()` - 45 edges
+2. `build_router()` - 46 edges
 3. `get()` - 39 edges
-4. `audit()` - 25 edges
+4. `audit()` - 26 edges
 5. `study_head()` - 23 edges
-6. `retire_seeded_demo_cases()` - 23 edges
-7. `start_job()` - 22 edges
-8. `require_admin()` - 22 edges
+6. `require_admin()` - 23 edges
+7. `retire_seeded_demo_cases()` - 23 edges
+8. `start_job()` - 22 edges
 9. `image_for()` - 20 edges
 10. `annotation_state()` - 20 edges
 
@@ -84,23 +74,15 @@
 ## Import Cycles
 - None detected.
 
-## Communities (47 total, 16 thin omitted)
+## Communities (37 total, 13 thin omitted)
 
 ### Community 0 - "test_platform.py"
-Cohesion: 0.08
-Nodes (39): fetch_catalog(), loop(), run_once(), _uuid(), CatalogJob, normalize_oncoradar(), upsert_discovery(), assigned() (+31 more)
+Cohesion: 0.07
+Nodes (48): fetch_catalog(), run_once(), feature_export(), image_directory(), import_demo_cases(), CatalogJob, CatalogPatientIndex, password_hash() (+40 more)
 
 ### Community 1 - "lung_api.py"
-Cohesion: 0.13
-Nodes (60): accept_job(), _acquire_worker_lock(), add_nodule(), annotation_state(), approve_case(), cancel_job(), check_editable(), check_version() (+52 more)
-
-### Community 2 - "WorkflowService"
 Cohesion: 0.10
-Nodes (21): get_db(), init_db(), AiArtifact, AiTask, AnnotationHead, AnnotationReviewEvent, AnnotationTaskEvent, Appointment (+13 more)
-
-### Community 3 - "simpleitk"
-Cohesion: 0.07
-Nodes (28): _database_url(), _default_database_url(), execute_job(), _extract_features(), main(), _decode(), read_oncoradar(), export_case_files() (+20 more)
+Nodes (68): accept_job(), _acquire_worker_lock(), add_nodule(), annotation_state(), approve_case(), cancel_job(), check_editable(), check_version() (+60 more)
 
 ### Community 4 - "app.js"
 Cohesion: 0.07
@@ -111,52 +93,32 @@ Cohesion: 0.11
 Nodes (56): activeNodule(), addNodule(), api(), axes(), base(), cancelPendingPoint(), changeEditSetting(), changeReview() (+48 more)
 
 ### Community 6 - "totalseg_stats.py"
-Cohesion: 0.11
-Nodes (29): CatalogDataset, CatalogPatientIndex, _job(), _binary(), compact_organs(), _compact_stats(), _detail(), _device() (+21 more)
+Cohesion: 0.13
+Nodes (26): _job(), _binary(), compact_organs(), _compact_stats(), _detail(), _device(), _dicom_files(), execute() (+18 more)
 
 ### Community 7 - "oncometra.py"
-Cohesion: 0.16
-Nodes (31): adjudicate(), Assign, assignment_payload(), can_review(), compare(), Comparison, create_assignment(), extract_features() (+23 more)
+Cohesion: 0.06
+Nodes (72): loop(), get_db(), AiArtifact, AiTask, AnnotationHead, AnnotationReviewEvent, AnnotationTaskEvent, Appointment (+64 more)
 
 ### Community 8 - "oncometra.js"
-Cohesion: 0.17
-Nodes (31): action(), addUser(), api(), assignReader(), badge(), boot(), compareReadings(), escape() (+23 more)
+Cohesion: 0.15
+Nodes (33): action(), addUser(), api(), assignReader(), badge(), boot(), cohortGaps(), cohortProjects() (+25 more)
 
-### Community 9 - "get"
-Cohesion: 0.18
-Nodes (23): get_report(), get_study(), get_workspace(), healthz(), list_ai_tasks(), list_billing(), list_integrations(), list_measurements() (+15 more)
-
-### Community 10 - "imaging.py"
-Cohesion: 0.16
-Nodes (20): get_slice(), MaskSliceUpdateRequest, _plane_size(), _plane_spacing_mm(), _slice_plane(), update_mask_slice(), decode_mask_png_b64(), discover_dicom_series() (+12 more)
-
-### Community 11 - "build_router"
-Cohesion: 0.14
-Nodes (34): audit(), audit_log(), ProjectDataset, require_admin(), require_project(), build_router(), catalog(), cohort() (+26 more)
+### Community 11 - "platform_api.py"
+Cohesion: 0.07
+Nodes (55): audit(), require_admin(), require_project(), apply_imported_rights(), build_router(), catalog(), cohort(), create_dataset() (+47 more)
 
 ### Community 12 - "main.py"
-Cohesion: 0.11
-Nodes (25): stop_jobs(), AiTaskRunRequest, AppointmentRequest, auto_segment(), AutoSegmentRequest, BillingItemRequest, create_billing_item(), create_measurement() (+17 more)
-
-### Community 13 - "platform_services.py"
-Cohesion: 0.15
-Nodes (12): import_images(), CaseSourceLink, CohortItem, WorkspaceAudit, WorkspaceProject, WorkspaceSession, import_cohort(), dataset_profile() (+4 more)
-
-### Community 14 - "platform_api.py"
-Cohesion: 0.14
-Nodes (15): CatalogImport, CohortImport, CohortRecord, DatasetFields, DatasetInput, DatasetUpdate, DiscoveryRequest, Evidence (+7 more)
+Cohesion: 0.05
+Nodes (86): init_db(), AiTaskRunRequest, AppointmentRequest, auto_segment(), AutoSegmentRequest, BillingItemRequest, _bulk_accession(), bulk_upload_dicom_folder() (+78 more)
 
 ### Community 15 - "ViewerFullscreen"
 Cohesion: 0.12
 Nodes (4): PLANE_AXES, UndoQueue, ViewerFullscreen, fixture()
 
-### Community 17 - "bulk_upload_dicom_folder"
-Cohesion: 0.15
-Nodes (11): _bulk_accession(), bulk_upload_dicom_folder(), create_study(), load_upload(), _parse_form_datetime(), _safe_upload_filename(), transcribe_audio(), preserve_series() (+3 more)
-
 ### Community 18 - "platformWorkspace"
-Cohesion: 0.19
-Nodes (14): platformWorkspace(), accessLabel(), bindDetailTabs(), datasetSheet(), downloadJson(), editDataset(), fact(), importJson() (+6 more)
+Cohesion: 0.17
+Nodes (17): platformWorkspace(), accessLabel(), bindDetailTabs(), datasetRows(), datasetSheet(), downloadJson(), editDataset(), fact() (+9 more)
 
 ### Community 20 - "AI-Native Cloud PACS/RIS Blueprint"
 Cohesion: 0.17
@@ -166,9 +128,9 @@ Nodes (12): AI-Native Cloud PACS/RIS Blueprint, Clinical Artifact Strategy For A
 Cohesion: 0.18
 Nodes (11): API overview, CT Early Response Web App (Prototype), Data format, Dictation, Existing Annotation Demo, Important, Legacy Prototype Reference, Notes for production hardening (+3 more)
 
-### Community 23 - "seed_demo"
-Cohesion: 0.12
-Nodes (15): add_user(), BootstrapUser, boundaries(), change_user_role(), current_user(), digest(), Login, logout() (+7 more)
+### Community 24 - "os"
+Cohesion: 0.06
+Nodes (21): _database_url(), _default_database_url(), main(), _decode(), read_oncoradar(), IntegrationService, crop_for_prompt(), image_for_plane() (+13 more)
 
 ### Community 25 - "MVP Scaffold"
 Cohesion: 0.22
@@ -211,24 +173,24 @@ Cohesion: 0.50
 Nodes (4): Cloud-Hosted, Fully Local, Hybrid, Local Hosting And Deployment Modes
 
 ## Knowledge Gaps
-- **74 isolated node(s):** `state`, `views`, `undoQueue`, `STATUS_LABELS`, `WINDOW_PRESETS` (+69 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 183 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
-- **16 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **73 isolated node(s):** `state`, `views`, `undoQueue`, `STATUS_LABELS`, `WINDOW_PRESETS` (+68 more)
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 185 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **13 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `AI-Native Cloud PACS/RIS Blueprint` connect `AI-Native Cloud PACS/RIS Blueprint` to `WorkflowService`, `MVP Build Sequence`, `Local Hosting And Deployment Modes`, `Recommended Platform Decomposition`, `README.md`?**
-  _High betweenness centrality (0.095) - this node is a cross-community bridge._
+- **Why does `AI-Native Cloud PACS/RIS Blueprint` connect `AI-Native Cloud PACS/RIS Blueprint` to `MVP Build Sequence`, `Local Hosting And Deployment Modes`, `oncometra.py`, `Recommended Platform Decomposition`, `README.md`?**
+  _High betweenness centrality (0.094) - this node is a cross-community bridge._
 - **Are the 13 inferred relationships involving `WorkflowService` (e.g. with `AiArtifact` and `AiTask`) actually correct?**
   _`WorkflowService` has 13 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `state`, `views`, `undoQueue` to the rest of the system?**
-  _74 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _73 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `test_platform.py` be split into smaller, more focused modules?**
-  _Cohesion score 0.0777323202805377 - nodes in this community are weakly interconnected._
-- **Why does `Suggested Domain Model` connect `WorkflowService` to `AI-Native Cloud PACS/RIS Blueprint`?**
-  _High betweenness centrality (0.093) - this node is a cross-community bridge._
+  _Cohesion score 0.06582952815829528 - nodes in this community are weakly interconnected._
+- **Why does `Suggested Domain Model` connect `oncometra.py` to `AI-Native Cloud PACS/RIS Blueprint`?**
+  _High betweenness centrality (0.091) - this node is a cross-community bridge._
 - **Are the 6 inferred relationships involving `build_router()` (e.g. with `CaseSourceLink` and `CatalogDataset`) actually correct?**
   _`build_router()` has 6 INFERRED edges - model-reasoned connections that need verification._
 - **Should `lung_api.py` be split into smaller, more focused modules?**
-  _Cohesion score 0.12712215320910972 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.1004995592124596 - nodes in this community are weakly interconnected._
