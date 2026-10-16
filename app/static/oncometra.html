@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Oncometra | Annotation</title>
-  <link rel="stylesheet" href="/assets/oncometra.css?v=cohorts-9">
-  <script type="module" src="/assets/oncometra.js?v=cohorts-9"></script>
+  <link rel="stylesheet" href="/assets/oncometra.css?v=cohorts-16">
+  <script type="module" src="/assets/oncometra.js?v=cohorts-16"></script>
 </head>
 <body>
   <section id="login-screen" class="login-screen" hidden>
@@ -24,7 +24,7 @@
       <span class="nav-spacer"></span><span id="storage-status" class="storage-status">Stockage local</span>
     </nav>
     <main id="content" class="content"></main>
-    <section id="annotation-page" class="annotation-page" hidden><div class="annotation-context"><button id="back-worklist" class="quiet">Retour à la file</button><span id="assignment-context"></span><span class="nav-spacer"></span><button id="assignment-guidelines">Protocole</button><button id="refresh-assignment">Actualiser</button></div><iframe id="viewer" title="Visionneuse d’annotation CT et IRM" allow="fullscreen" allowfullscreen></iframe></section>
+    <section id="annotation-page" class="annotation-page" hidden><div class="annotation-context"><div class="annotation-identity"><button id="back-worklist" class="quiet">Retour à la file</button><span id="assignment-context"></span><span id="seg-state" class="seg-state" hidden></span></div><div id="browse-nav" class="browse-nav" hidden><div class="browse-side"><button type="button" id="browse-prev-patient">Patient précédent</button><button type="button" id="browse-prev-time">Temps précédent</button></div><p id="browse-position" class="browse-position"></p><div class="browse-side browse-side-next"><button type="button" id="browse-next-time">Temps suivant</button><button type="button" id="browse-next-patient">Patient suivant</button></div></div><div class="annotation-actions"><button id="assignment-guidelines">Protocole</button><button id="assignment-organs">Organes et HU</button><button id="refresh-assignment">Actualiser</button></div></div><iframe id="viewer" title="Visionneuse d’annotation CT et IRM" allow="fullscreen" allowfullscreen></iframe></section>
     <footer id="app-footer"><span>Cohortes publiques à annoter. Pas un dispositif de décision clinique.</span></footer>
   </div>
   <dialog id="modal"><div class="modal-heading"><h2 id="modal-title"></h2><button id="modal-close" class="quiet" aria-label="Close dialog">Close</button></div><div id="modal-body"></div></dialog>

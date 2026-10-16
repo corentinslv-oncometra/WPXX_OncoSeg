@@ -1,10 +1,10 @@
-import {platformWorkspace} from '/assets/platform-workspace.mjs?v=cohorts-9';
+import {platformWorkspace} from '/assets/platform-workspace.mjs?v=cohorts-16';
 const $ = id => document.getElementById(id);
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const roleName = value => ({admin:'Administrateur', reviewer:'Radiologue', junior_annotator:'Annotateur', senior_annotator:'Annotateur senior'}[value] || value);
 const statusName = value => ({new:'À annoter', in_progress:'Annotation en cours', completed:'À valider', approved:'Validé', queued:'En attente', running:'En cours', succeeded:'Extrait', failed:'Échec'}[value] || value);
 const badge = value => `<span class="status ${escape(value)}">${escape(statusName(value))}</span>`;
-const state = {user:null, data:null, tab:'datasets', project:'', query:'', status:'', assignment:null, jobs:[], users:[]};
+const state = {user:null, data:null, tab:'datasets', project:'', query:'', status:'', assignment:null, jobs:[], users:[], browse:null};
 let toastTimer;
 async function api(path, data, method) {
   const options = {method:method || (data ? 'POST':'GET'), credentials:'same-origin', headers:{}};
@@ -49,9 +49,9 @@ function renderCohorts(){
   const rows=cohorts.map(project=>{
     const status=cohortStatus(project);
     const gaps=cohortGaps(project);
-    return `<tr><td><strong>${escape(project.name)}</strong><small>${escape(project.dataset.name)} · ${project.modality==='MR'?'IRM':'CT'}</small>${gaps.length?`<small>Encore : ${escape(gaps.join(', '))}</small>`:''}</td><td><span class="status ${status.id}">${escape(status.label)}</span></td><td>${project.cases}</td><td>${project.approved}</td><td><div class="row-actions"><button type="button" disabled title="Aucun modèle de segmentation automatique n’est installé. Les radiologues annotent le masque à la main.">Lancer la segmentation</button><button data-import-project="${project.id}">Importer les images</button>${project.cases?`<button data-project="${project.id}">Voir les examens</button>`:''}</div><small>Segmentation automatique indisponible</small></td></tr>`;
+    return `<tr><td><strong>${escape(project.name)}</strong><small>${escape(project.dataset.name)} · ${project.modality==='MR'?'IRM':'CT'}</small>${gaps.length?`<small>Encore : ${escape(gaps.join(', '))}</small>`:''}</td><td><span class="status ${status.id}">${escape(status.label)}</span></td><td>${project.cases}</td><td>${project.approved}</td><td><div class="row-actions"><button type="button" disabled title="Le calcul part avant la page À valider, un examen à la fois. Il ne se lance pas depuis cette liste.">Lancer la segmentation</button><button class="primary" data-browse-project="${project.id}">Choisir un patient</button><button data-import-project="${project.id}">Importer des fichiers</button>${project.cases?`<button data-project="${project.id}">Voir les examens</button>`:''}</div><small>Préparée avant la validation</small></td></tr>`;
   }).join('');
-  $('content').innerHTML=heading('Cohortes','Les datasets que vous avez choisis.')+`<section class="table-panel">${cohorts.length?`<div class="table-scroll"><table><thead><tr><th>Cohorte</th><th>État</th><th>Images</th><th>Validés</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="empty"><h2>Aucune cohorte</h2><p>'+(state.user.role==='admin'?'Choisissez un dataset exploitable.':'Aucune cohorte n’est encore ouverte.')+'</p></div>'}</section><p class="small-note">La segmentation automatique n’est pas installée. Le bouton reste sur la ligne et ne lance rien. Les radiologues annotent le masque à la main.</p>`;
+  $('content').innerHTML=heading('Cohortes','Les datasets que vous avez choisis.')+`<section class="table-panel">${cohorts.length?`<div class="table-scroll"><table><thead><tr><th>Cohorte</th><th>État</th><th>Images</th><th>Validés</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="empty"><h2>Aucune cohorte</h2><p>'+(state.user.role==='admin'?'Choisissez un dataset exploitable.':'Aucune cohorte n’est encore ouverte.')+'</p></div>'}</section><p class="small-note">TotalSegmentator calcule les organes et toutes les HU avant la page À valider. S’il n’y a pas de fichier SEG, la tumeur est proposée selon le type de cancer. Un seul examen est préparé sur ce poste, sans GPU.</p>`;
 }
 
 function filters(){return `<div class="filters"><input id="filter-query" aria-label="Chercher un examen" placeholder="Chercher un examen" value="${escape(state.query)}"><select id="filter-project" aria-label="Cohorte">${projectOptions()}</select><select id="filter-status" aria-label="État"><option value="">Tous les états</option>${['new','in_progress','completed','approved'].map(s=>`<option value="${s}" ${state.status===s?'selected':''}>${statusName(s)}</option>`).join('')}</select></div>`;}
@@ -86,11 +86,106 @@ function renderReview(){
   }
   renderQueue();
 }
+function browsePosition(patientId, timepointId){
+  const patients=state.browse?.catalog?.patients||[];
+  const patientIndex=patients.findIndex(item=>item.id===patientId);
+  if(patientIndex<0) return null;
+  const timepoints=patients[patientIndex].timepoints;
+  const timeIndex=timepoints.findIndex(item=>item.id===timepointId);
+  if(timeIndex<0) return null;
+  const neighbor=step=>{
+    const target=patientIndex+step;
+    if(target<0||target>=patients.length) return null;
+    const times=patients[target].timepoints;
+    const chosen=Math.min(timeIndex, times.length-1);
+    return {patient_id:patients[target].id, timepoint_id:times[chosen].id};
+  };
+  return {patient_id:patientId, timepoint_id:timepointId, label:timepoints[timeIndex].label,
+    patient_index:patientIndex, patient_count:patients.length, timepoint_index:timeIndex, timepoint_count:timepoints.length,
+    previous_timepoint:timeIndex>0?{patient_id:patientId, timepoint_id:timepoints[timeIndex-1].id}:null,
+    next_timepoint:timeIndex+1<timepoints.length?{patient_id:patientId, timepoint_id:timepoints[timeIndex+1].id}:null,
+    previous_patient:neighbor(-1), next_patient:neighbor(1)};
+}
+function renderBrowseNav(){
+  const nav=$('browse-nav');
+  const position=state.browse&&browsePosition(state.browse.patientId, state.browse.timepointId);
+  if(!nav) return;
+  if(!position){nav.hidden=true;return;}
+  Object.assign(state.browse, position);
+  nav.hidden=false;
+  $('browse-position').innerHTML=`<strong>${escape(position.patient_id)}</strong><span>${escape(position.label)}</span><span>Patient ${position.patient_index + 1} / ${position.patient_count} · Temps ${position.timepoint_index + 1} / ${position.timepoint_count}</span>`;
+  $('browse-prev-patient').disabled=!position.previous_patient;
+  $('browse-next-patient').disabled=!position.next_patient;
+  $('browse-prev-time').disabled=!position.previous_timepoint;
+  $('browse-next-time').disabled=!position.next_timepoint;
+}
+function renderPatientPicker(){
+  const host=$('local-status');
+  const browse=state.browse;
+  if(!host||!browse?.catalog) return;
+  const patient=browse.catalog.patients.find(item=>item.id===browse.patientId)||browse.catalog.patients[0];
+  browse.patientId=patient.id;
+  if(!patient.timepoints.some(item=>item.id===browse.timepointId)) browse.timepointId=patient.timepoints[0].id;
+  host.innerHTML=`<label class="form-label">Personne<select id="browse-patient">${browse.catalog.patients.map(item=>`<option value="${escape(item.id)}" ${item.id===browse.patientId?'selected':''}>${escape(item.id)} · ${item.timepoints.length} temps</option>`).join('')}</select></label><label class="form-label">Temps<select id="browse-time">${patient.timepoints.map(item=>`<option value="${escape(item.id)}" ${item.id===browse.timepointId?'selected':''}>${escape(item.label)}</option>`).join('')}</select></label><button type="button" id="browse-open" class="primary">Ouvrir cet examen</button>`;
+  $('browse-patient').onchange=()=>{browse.patientId=$('browse-patient').value;browse.timepointId='';renderPatientPicker();};
+  $('browse-time').onchange=()=>{browse.timepointId=$('browse-time').value;};
+  $('browse-open').onclick=action(()=>openBrowsed());
+}
+async function loadPatientPicker(form){
+  if(!form.deidentified.checked) throw new Error('Confirmez que les images sont dé-identifiées.');
+  const projectId=new FormData(form).get('project_id');
+  const path=$('local-path').value.trim();
+  if(!path) throw new Error('Indiquez un dossier dans data.');
+  $('local-status').textContent='Lecture des patients…';
+  const catalog=await api(`/api/projects/${projectId}/local-catalog?path=${encodeURIComponent(path)}`);
+  if(!catalog.patients.length) throw new Error('Aucun volume dans ce dossier.');
+  state.browse={projectId, path, catalog, patientId:catalog.patients[0].id, timepointId:catalog.patients[0].timepoints[0].id};
+  renderPatientPicker();
+}
+function browseDataset(projectId){
+  showModal('Choisir un examen',`<form id="import-form"><p class="small-note">Un seul patient et un seul temps sont chargés. Vous pourrez passer au temps ou au patient suivant dans la visionneuse.</p><label class="form-label">Dossier déjà dans data<input id="local-path" value="TCIA_Data/hcc_tace_seg" spellcheck="false"></label><input type="hidden" name="project_id" value="${escape(projectId)}"><label class="form-label"><span><input name="deidentified" type="checkbox" required> Ces images sont dé-identifiées et autorisées pour cette cohorte.</span></label><div id="local-status" class="small-note"></div><button class="primary">Afficher les patients</button></form>`);
+  $('import-form').onsubmit=action(async event=>{event.preventDefault();await loadPatientPicker(event.target);});
+}
+async function openBrowsed(target){
+  const browse=state.browse;
+  if(!browse) throw new Error('Choisissez d’abord un patient.');
+  const patientId=target?.patient_id||$('browse-patient')?.value||browse.patientId;
+  const timepointId=target?.timepoint_id||$('browse-time')?.value||browse.timepointId;
+  if($('browse-position')) $('browse-position').textContent='Ouverture du volume…';
+  if($('browse-open')){$('browse-open').disabled=true;$('browse-open').textContent='Ouverture…';}
+  const result=await api(`/api/projects/${browse.projectId}/local-catalog/open`,{path:browse.path,patient_id:patientId,timepoint_id:timepointId});
+  state.browse={...browse, ...result, patientId:result.patient_id, timepointId:result.timepoint_id};
+  if($('modal')?.open) $('modal').close();
+  await refresh(false);
+  await openAssignment(result.study_id);
+}
+function renderSegState(source){
+  const seg=$('seg-state');
+  if(!seg) return;
+  if(!source || source.seg_present==null){seg.hidden=true;return;}
+  seg.hidden=false;
+  seg.classList.remove('used','unused','absent');
+  if(source.seg_used){seg.textContent='SEG présent · utilisé';seg.classList.add('used');}
+  else if(source.seg_present){seg.textContent='SEG présent · non utilisé';seg.classList.add('unused');}
+  else{seg.textContent='SEG absent';seg.classList.add('absent');}
+}
 async function openAssignment(id){
   let row=state.data.assignments.find(a=>a.id===id);if(!row){await refresh(false);row=state.data.assignments.find(a=>a.id===id);}
   if(!row)throw new Error('Lecture introuvable');state.assignment=row;
   $('assignment-context').textContent=`${projectName(row.project_id)} / ${row.reader}${row.user_id===state.user.id?'':' / lecture seule'}`;
+  const exam=state.data.cases.find(item=>item.id===row.case_id);
+  const source=exam?.source;
+  renderSegState(source);
+  if(source?.local_path&&source.local_patient&&source.local_timepoint){
+    if(!state.browse||state.browse.path!==source.local_path||!state.browse.catalog){
+      const catalog=await api(`/api/projects/${row.project_id}/local-catalog?path=${encodeURIComponent(source.local_path)}`);
+      state.browse={projectId:row.project_id, path:source.local_path, catalog};
+    }
+    state.browse.patientId=source.local_patient;
+    state.browse.timepointId=source.local_timepoint;
+  }
   $('viewer').src=`/viewer?study_id=${id}&embedded=1`;await showTab('annotation');
+  renderBrowseNav();
 }
 async function renderAdmin(){
   state.users=await api('/api/users');
@@ -102,11 +197,27 @@ function importImages(cohortItem=null, projectId=''){
   const cohorts=cohortProjects();
   if(!cohorts.length) return toast('Ouvrez d’abord un dataset.', true);
   const selected=projectId||state.project||cohorts[0].id;
-  showModal('Importer des images',`<form id="import-form"><label class="form-label">Cohorte<select name="project_id">${projectOptions(false, selected)}</select></label><label class="form-label">Identifiant d’examen<input name="patient_id" required maxlength="120" value="${escape(cohortItem?.patient_id||'')}" ${cohortItem?'readonly':''} placeholder="ex. COHORTE-012"></label>${cohortItem?`<input type="hidden" name="cohort_item_id" value="${cohortItem.id}">`:''}<div id="drop-zone" class="drop-zone">Déposez des fichiers DICOM, un dossier, une archive ZIP ou un volume NIfTI<label>Choisir des fichiers<input id="upload-files" type="file" multiple></label><label>Choisir un dossier<input id="upload-folder" type="file" multiple webkitdirectory></label><p id="file-count">Aucun fichier</p></div><label class="form-label"><span><input name="deidentified" type="checkbox" required> Ces images sont dé-identifiées et autorisées pour cette cohorte.</span></label><p class="small-note">Limite 256 Mo. Les volumes trop grands ou obliques sont refusés. Les identifiants patient ne sont pas retirés automatiquement.</p><button id="upload-submit" class="primary">Importer</button></form>`);
+  showModal('Importer des images',`<form id="import-form"><label class="form-label">Cohorte<select name="project_id">${projectOptions(false, selected)}</select></label><label class="form-label">Identifiant d’examen<input name="patient_id" maxlength="120" value="${escape(cohortItem?.patient_id||'')}" ${cohortItem?'readonly':''} placeholder="ex. COHORTE-012"></label>${cohortItem?`<input type="hidden" name="cohort_item_id" value="${cohortItem.id}">`:''}<div id="drop-zone" class="drop-zone">Déposez des fichiers DICOM, un dossier, une archive ZIP ou un volume NIfTI<label>Choisir des fichiers<input id="upload-files" type="file" multiple></label><label>Choisir un dossier<input id="upload-folder" type="file" multiple webkitdirectory></label><p id="file-count">Aucun fichier</p></div><p class="small-note">Le dépôt depuis le navigateur est limité à 256 Mo.</p><label class="form-label">Dossier déjà dans data<input id="local-path" value="TCIA_Data/hcc_tace_seg" spellcheck="false"></label><div id="local-status" class="small-note">Un seul patient et un seul temps sont ouverts. Le reste du dossier reste sur le disque.</div><label class="form-label"><span><input name="deidentified" type="checkbox" required> Ces images sont dé-identifiées et autorisées pour cette cohorte.</span></label><button type="submit" id="import-local" class="primary">Choisir un patient</button><button type="submit" id="upload-submit">Importer la sélection</button></form>`);
   let files=[];function selectedFiles(list){files=[...list];$('file-count').textContent=`${files.length} fichier${files.length>1?'s':''}`;}
   for(const id of ['upload-files','upload-folder'])$(id).onchange=event=>selectedFiles(event.target.files);
   const zone=$('drop-zone');zone.ondragover=event=>event.preventDefault();zone.ondrop=action(async event=>{event.preventDefault();const {collectDirectoryEntries}=await import('/import-files.mjs');const entries=[...event.dataTransfer.items].map(item=>item.webkitGetAsEntry?.()).filter(Boolean);if(entries.length){const result=await collectDirectoryEntries(entries);selectedFiles(result.map(item=>item.file));}else selectedFiles(event.dataTransfer.files);});
-  $('import-form').onsubmit=action(async event=>{event.preventDefault();if(!files.length)throw new Error('Sélectionnez des images.');const data=new FormData(event.target);for(const file of files)data.append('files',file,file.webkitRelativePath||file.name);$('upload-submit').disabled=true;$('upload-submit').textContent='Import…';try{await api('/api/import',data);$('modal').close();await refresh();toast('Images importées.');}finally{if($('upload-submit')){$('upload-submit').disabled=false;$('upload-submit').textContent='Importer';}}});
+  $('import-form').onsubmit=action(async event=>{
+    event.preventDefault();
+    const submitter=event.submitter;
+    if(submitter&&submitter.id==='upload-submit'){
+      if(!files.length) throw new Error('Sélectionnez des images, ou choisissez un patient.');
+      const bytes=files.reduce((total,file)=>total+file.size,0);
+      if(files.length>3000||bytes>256*1024*1024) throw new Error('Cette sélection est trop grande. Choisissez un patient et un temps.');
+      const data=new FormData(event.target);
+      if(!String(data.get('patient_id')||'').trim()) throw new Error('Indiquez un identifiant d’examen.');
+      for(const file of files) data.append('files',file,file.webkitRelativePath||file.name);
+      $('upload-submit').disabled=true;$('upload-submit').textContent='Import…';
+      try{await api('/api/import',data);$('modal').close();await refresh();toast('Images importées.');}
+      finally{if($('upload-submit')){$('upload-submit').disabled=false;$('upload-submit').textContent='Importer la sélection';}}
+      return;
+    }
+    await loadPatientPicker(event.target);
+  });
 }
 
 const platform=platformWorkspace({state,api,escape,showModal,action,toast,refresh,importImages});
@@ -114,6 +225,7 @@ const platform=platformWorkspace({state,api,escape,showModal,action,toast,refres
 $('content').addEventListener('click',action(async event=>{
   const button=event.target.closest('button');if(!button||button.dataset.platformAction)return;
   if(button.dataset.project){state.project=button.dataset.project;state.status='';state.query='';return showTab('review');}
+  if(button.dataset.browseProject)return browseDataset(button.dataset.browseProject);
   if(button.dataset.importProject)return importImages(null, button.dataset.importProject);
   if(button.dataset.begin){const row=await api(`/api/cases/${button.dataset.begin}/assign`,{});await refresh(false);return openAssignment(row.id);}
   if(button.dataset.open)return openAssignment(button.dataset.open);
@@ -126,7 +238,17 @@ $('content').addEventListener('click',action(async event=>{
 $('navigation').addEventListener('click',action(async event=>{const button=event.target.closest('[data-tab]');if(button){if(button.dataset.tab!=='annotation')await refresh(false);await showTab(button.dataset.tab);}}));
 $('modal-close').onclick=()=>$('modal').close();
 $('back-worklist').onclick=action(async()=>{await refresh(false);await showTab('review');});
+for(const [id,key] of [['browse-prev-patient','previous_patient'],['browse-next-patient','next_patient'],['browse-prev-time','previous_timepoint'],['browse-next-time','next_timepoint']]){
+  $(id).onclick=action(async()=>{const target=state.browse?.[key];if(target) await openBrowsed(target);});
+}
 $('refresh-assignment').onclick=action(async()=>{await refresh(false);await openAssignment(state.assignment.id);});
+function huText(value){return Number(value).toLocaleString('fr-FR',{maximumFractionDigits:1});}
+$('assignment-organs').onclick=action(async()=>{
+  if(!state.assignment) return;
+  const result=await api(`/api/studies/${state.assignment.id}/organs`);
+  const rows=(result.organs||[]).map(item=>`<tr><td>${escape(item.label)}</td><td>${item.volume_mm3>=1000?`${(item.volume_mm3/1000).toLocaleString('fr-FR',{maximumFractionDigits:1})} cm³`:`${Math.round(item.volume_mm3).toLocaleString('fr-FR')} mm³`}</td><td>${huText(item.hu_mean)}</td><td>${huText(item.hu_median)}</td><td>${huText(item.hu_std)}</td><td>${huText(item.hu_min)}</td><td>${huText(item.hu_max)}</td><td>${huText(item.hu_p05)}</td><td>${huText(item.hu_p95)}</td></tr>`).join('');
+  showModal('Organes et HU',`<p class="small-note">${escape(result.cancer||'')} · ${escape(result.tumor_note||'Les valeurs sont en unités Hounsfield, calculées dans chaque organe.')}</p><div class="table-scroll organs-table"><table><thead><tr><th>Organe</th><th>Volume</th><th>Moyenne</th><th>Médiane</th><th>Écart-type</th><th>Min</th><th>Max</th><th>P5</th><th>P95</th></tr></thead><tbody>${rows||'<tr><td colspan="9">Aucun organe mesuré.</td></tr>'}</tbody></table></div>`);
+});
 $('assignment-guidelines').onclick=()=>showModal(`Protocole / version ${state.assignment.project_version||'—'}`,`<div class="guideline-copy">${escape(state.assignment.guidelines||'Aucun protocole enregistré pour cette lecture.')}</div>`);
 window.addEventListener('message',action(async event=>{if(event.origin!==location.origin||event.source!==$('viewer').contentWindow||event.data?.type!=='oncometra:annotation-updated')return;await refresh(false);const row=state.data.assignments.find(a=>a.id===event.data.studyId);if(row&&row.id===state.assignment?.id)state.assignment=row;}));
 $('logout').onclick=action(async()=>{await api('/api/auth/logout',{});$('viewer').src='about:blank';showLogin();});

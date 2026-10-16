@@ -169,8 +169,47 @@ def assignment_payload(db, assignment):
             "project_version": assignment.provenance.get("project_version"), **state_for(db, assignment)}
 
 
+def _remember_seg_status(case) -> bool:
+    source = dict(case.source or {})
+    if "seg_present" in source and "seg_used" in source:
+        return False
+    present = False
+    folder, timepoint = source.get("local_path"), source.get("local_timepoint")
+    if folder and timepoint:
+        try:
+            from app.services.dicom_seg import study_has_seg
+            from app.services.local_dicom_import import resolve_data_dir
+            series = (resolve_data_dir(folder) / timepoint).resolve()
+            present = series.is_dir() and study_has_seg(series)
+        except Exception:
+            present = False
+    source["seg_present"] = present
+    source["seg_used"] = bool(source.get("tumor_from_seg"))
+    case.source = source
+    return True
+
+
 def image_directory(case):
     return DATA_ROOT / "workspace" / "cases" / case.id
+
+
+def _seed_tumor_overlay(db, study_id, reference: Path, user):
+    """Show the DICOM SEG tumor in red until the reader edits the mask."""
+    from app.services.nodules import new_nodule
+    if not reference.is_file():
+        return
+    head = db.get(AnnotationHead, study_id)
+    if head is None or head.revision_id:
+        return
+    image = lung.image_for(study_id)
+    mask = sitk.GetArrayFromImage(sitk.ReadImage(str(reference))).astype(np.uint8)
+    if mask.shape != tuple(reversed(image.GetSize())) or not int(mask.sum()):
+        return
+    nodule = new_nodule(1)
+    nodule["name"] = "Tumeur"
+    nodule["color"] = [220, 38, 38]
+    db.info["annotation_actor"] = user_payload(user)
+    lung.save_revision(db, head, image, mask, "source-segmentation", {"source": "DICOM SEG tumor"}, [nodule])
 
 
 def create_assignment(db, case, user, kind="reader", source=None):
@@ -434,6 +473,8 @@ def overview(user=Depends(current_user)):
     with SessionLocal() as db:
         available_projects = visible_projects(db, user)
         cases = list(db.scalars(select(WorkspaceCase).where(WorkspaceCase.project_id.in_([p.id for p in available_projects]))))
+        if any(_remember_seg_status(case) for case in cases):
+            db.commit()
         assignments = list(db.scalars(select(WorkspaceAssignment).where(WorkspaceAssignment.case_id.in_([case.id for case in cases]))))
         visible = assignments if can_review(user) else [a for a in assignments if a.user_id == user.id]
         rows = [assignment_payload(db, assignment) for assignment in visible]
@@ -617,6 +658,78 @@ async def import_images(project_id: str = Form(...), patient_id: str = Form(...)
             return {"case_ids": imported, "warnings": errors}
         except (ValueError, RuntimeError) as error:
             raise HTTPException(422, str(error)) from error
+
+
+class LocalFolderImport(BaseModel):
+    path: str = Field(min_length=1, max_length=300)
+    deidentified: bool = False
+
+
+@app.post("/api/projects/{project_id}/import-folder", status_code=202)
+def begin_local_import(project_id: str, req: LocalFolderImport, user=Depends(current_user)):
+    from app.services.local_dicom_import import start_folder_import
+    require_project(user, project_id)
+    if not req.deidentified:
+        raise HTTPException(422, "Confirmez que ces images sont dé-identifiées et autorisées.")
+    try:
+        return start_folder_import(project_id, req.path, user.id)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.get("/api/projects/{project_id}/import-folder")
+def local_import_status(project_id: str, user=Depends(current_user)):
+    from app.services.local_dicom_import import import_status
+    require_project(user, project_id)
+    return import_status(project_id)
+
+
+@app.get("/api/projects/{project_id}/local-catalog")
+def local_catalog(project_id: str, path: str = "", user=Depends(current_user)):
+    from app.services.local_dicom_import import scan_catalog
+    require_project(user, project_id)
+    try:
+        return scan_catalog(path)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+class LocalExam(BaseModel):
+    path: str = Field(min_length=1, max_length=300)
+    patient_id: str = Field(min_length=1, max_length=200)
+    timepoint_id: str = Field(min_length=1, max_length=500)
+
+
+@app.post("/api/projects/{project_id}/local-catalog/open")
+def open_local_exam(project_id: str, req: LocalExam, user=Depends(current_user)):
+    from app.services.local_dicom_import import catalog_position, ensure_local_case
+    require_project(user, project_id)
+    try:
+        case_id = ensure_local_case(project_id, req.path, req.patient_id, req.timepoint_id)
+        position = catalog_position(req.path, req.patient_id, req.timepoint_id)
+        from app.services.exam_autoseg import attach_stored_result
+        attach_stored_result(case_id)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    with SessionLocal() as db:
+        case = db.get(WorkspaceCase, case_id)
+        account = db.get(WorkspaceUser, user.id)
+        assignment = create_assignment(db, case, account)
+        _seed_tumor_overlay(db, assignment.study_id, image_directory(case) / "reference.nii.gz", account)
+        audit(db, account, "local_exam_opened", assignment.study_id, {"patient": req.patient_id, "timepoint": req.timepoint_id})
+        db.commit()
+        return {"study_id": assignment.study_id, **position}
+
+
+@app.get("/api/studies/{study_id}/organs")
+def study_organs(study_id: UUID, user=Depends(current_user)):
+    from app.services.exam_autoseg import load_organ_table
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        payload = load_organ_table(image_directory(case))
+    if payload is None:
+        raise HTTPException(404, "Cet examen n’a pas encore de mesures d’organes.")
+    return payload
 
 
 @app.get("/api/studies/{study_id}/dicom/download")

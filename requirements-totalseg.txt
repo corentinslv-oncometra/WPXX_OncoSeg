@@ -1,0 +1,4 @@
+# Separate environment: py -3.14 -m venv .venv-totalseg
+# .venv-totalseg\Scripts\python.exe -m pip install -r requirements-totalseg.txt
+# CPU only on this machine. Do not install this into the application environment.
+TotalSegmentator==2.18.0

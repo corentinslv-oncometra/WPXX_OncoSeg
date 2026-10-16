@@ -186,6 +186,32 @@ def test_reader_isolation_and_independent_approval(clients):
     assert reviewer.post(f'/api/lung/studies/{other}/approve',json={'version':own['version'],'revision_id':own['revision_id'],'reviewed':True}).status_code==403
 
 
+def test_add_lesion_then_delete_it_keeps_the_connection(clients):
+    _, reader, _ = clients
+    study_id = assigned(reader, fixture_case())
+    base = f"/api/lung/studies/{study_id}"
+    state = reader.get(base).json()
+    added = reader.post(f"{base}/nodules", json={"version": state["version"]})
+    assert added.status_code == 200, added.text
+    added_body = added.json()
+    assert added_body["nodule_label"] == 2
+    assert [nodule["label"] for nodule in added_body["nodules"]] == [1, 2]
+    deleted = reader.post(f"{base}/delete-mask", json={"version": added_body["version"], "nodule_label": 2})
+    assert deleted.status_code == 200, deleted.text
+    assert [nodule["label"] for nodule in deleted.json()["nodules"]] == [1]
+    state = reader.get(base)
+    assert state.status_code == 200, state.text
+    last = reader.post(f"{base}/delete-mask", json={"version": state.json()["version"], "nodule_label": 1})
+    assert last.status_code == 200, last.text
+    assert last.json()["nodules"] == []
+    state = reader.get(base)
+    assert state.status_code == 200, state.text
+    assert state.json()["nodules"] == []
+    mask = reader.get(f"{base}/mask", params={"revision_id": state.json()["revision_id"]})
+    assert mask.status_code == 200, mask.text
+    assert mask.content
+
+
 def test_float_mri_and_export_provenance(clients):
     admin, reader, reviewer=clients
     case=fixture_case('MR')
@@ -284,6 +310,145 @@ def test_configurable_features_require_current_approval(clients):
     assert job['status']=='succeeded',job
     assert set(job['protocol']['featureClass'])=={'shape','firstorder'}
     assert all(key.startswith(('original_shape_','original_firstorder_')) for key in job['result']['rows'][0]['features'])
+
+
+def _write_ct_series(directory: Path, patient_id: str, series_uid: str):
+    directory.mkdir(parents=True)
+    volume = sitk.GetImageFromArray(np.zeros((4, 8, 8), np.int16))
+    volume.SetSpacing((1.0, 1.0, 1.0))
+    tags = {"0008|0060": "CT", "0010|0020": patient_id, "0020|000e": series_uid,
+            "0020|000d": "1.2.840.10008.1", "0020|0011": "1", "0020|0037": "1\\0\\0\\0\\1\\0"}
+    for index in range(volume.GetSize()[2]):
+        sl = volume[:, :, index]
+        for key, value in tags.items():
+            sl.SetMetaData(key, value)
+        sl.SetMetaData("0020|0013", str(index + 1))
+        sl.SetMetaData("0020|0032", "\\".join(map(str, volume.TransformIndexToPhysicalPoint((0, 0, index)))))
+        writer = sitk.ImageFileWriter()
+        writer.KeepOriginalImageUIDOn()
+        writer.SetFileName(str(directory / f"{index:03d}.dcm"))
+        writer.Execute(sl)
+
+
+def test_cancer_type_selects_lesion_task_and_organ_hu():
+    from app.services.exam_autoseg import binary_labels, hu_rows, lesion_task_for_cancer
+    liver = lesion_task_for_cancer("Hepatocellular carcinoma (HCC)")
+    lung = lesion_task_for_cancer("NSCLC")
+    assert liver[0] == "liver_lesions" and lung[0] == "lung_nodules"
+    assert lesion_task_for_cancer("Renal cell carcinoma") is None
+    ct = np.arange(16, dtype=np.float32).reshape(2, 2, 4)
+    labels = np.zeros((2, 2, 4), np.uint8)
+    labels[0] = 1
+    rows = hu_rows(ct, labels, {1: "liver"}, 1.0)
+    assert rows[0]["voxels"] == 8 and rows[0]["hu_min"] == 0 and rows[0]["hu_max"] == 7
+    mask = binary_labels(np.array([[[1, 2]]], np.uint8), {1: "liver_lesions", 2: "liver_vessels"}, ("lesion", "tumor"))
+    assert int(mask.sum()) == 1 and mask[0, 0, 0] == 1 and mask[0, 0, 1] == 0
+
+
+def test_study_seg_file_is_detected_without_reading_pixels(tmp_path):
+    from pydicom.dataset import Dataset, FileMetaDataset
+    from pydicom.uid import ExplicitVRLittleEndian, generate_uid
+    from app.services.dicom_seg import study_has_seg
+
+    def write(path, modality, label=None):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        meta = FileMetaDataset()
+        meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.2"
+        meta.MediaStorageSOPInstanceUID = generate_uid()
+        meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        dataset = Dataset()
+        dataset.file_meta = meta
+        dataset.is_little_endian = True
+        dataset.is_implicit_VR = False
+        dataset.Modality = modality
+        dataset.SeriesInstanceUID = generate_uid()
+        dataset.SOPClassUID = meta.MediaStorageSOPClassUID
+        dataset.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
+        if label:
+            segment = Dataset()
+            segment.SegmentNumber = 1
+            segment.SegmentLabel = label
+            dataset.SegmentSequence = [segment]
+        dataset.save_as(path, enforce_file_format=True)
+
+    study = tmp_path / "study"
+    write(study / "ct" / "one.dcm", "CT")
+    assert not study_has_seg(study / "ct")
+    write(study / "seg" / "one.dcm", "SEG", "Mass")
+    assert study_has_seg(study / "ct")
+
+
+def test_tumor_segment_is_painted_in_ct_coordinates():
+    from app.services.dicom_seg import is_tumor_text, paint_frames, paint_on_grid
+    image = sitk.GetImageFromArray(np.zeros((4, 8, 8), np.int16))
+    image.SetSpacing((1, 1, 1))
+    image.SetOrigin((0, 0, 0))
+    frame = np.zeros((8, 8), np.uint8)
+    frame[3, 2] = 1
+    mask = paint_frames(image, [frame], [[0, 0, 1]], [1, 0, 0], [0, 1, 0], 1, 1)
+    assert mask[1, 3, 2] == 1 and int(mask.sum()) == 1
+    decreasing = [[0, 0, 10], [0, 0, 8], [0, 0, 6], [0, 0, 4]]
+    matched = paint_on_grid(decreasing, [frame], [[0, 0, 6]], [1, 0, 0, 0, 1, 0], 1, 1, 8, 8)
+    assert matched[2, 3, 2] == 1 and int(matched.sum()) == 1
+    missed = paint_on_grid(decreasing, [frame], [[0, 0, 100]], [1, 0, 0, 0, 1, 0], 1, 1, 8, 8)
+    assert int(missed.sum()) == 0
+    assert is_tumor_text("Mass", "Tumor")
+    assert not is_tumor_text("Liver", "Liver")
+    assert not is_tumor_text("Portal vein", "vessels")
+
+
+def test_local_catalog_opens_one_timepoint(clients):
+    admin, _, _ = clients
+    root = Path(os.environ["APP_STORAGE_ROOT"]) / "incoming"
+    _write_ct_series(root / "PAT1" / "2016-01-02-NA-aaa-11111" / "2-Portal-aaaa1", "P1", "1.2.3.4.5.1")
+    _write_ct_series(root / "PAT1" / "2016-06-01-NA-bbb-22222" / "3-Follow-bbbb2", "P1", "1.2.3.4.5.2")
+    seg = root / "PAT1" / "2016-01-02-NA-aaa-11111" / "300-SEG-cccc3"
+    seg.mkdir(parents=True)
+    (seg / "one.dcm").write_bytes(b"0")
+    _write_ct_series(root / "PAT2" / "2017-01-01-NA-ddd-44444" / "2-Portal-dddd4", "P2", "1.2.3.4.5.4")
+    catalog = admin.get("/api/projects/lung-ct/local-catalog", params={"path": "incoming"})
+    assert catalog.status_code == 200, catalog.text
+    patients = catalog.json()["patients"]
+    assert [item["id"] for item in patients] == ["PAT1", "PAT2"]
+    assert len(patients[0]["timepoints"]) == 2
+    assert "SEG" not in patients[0]["timepoints"][0]["label"]
+    opened = admin.post("/api/projects/lung-ct/local-catalog/open", json={
+        "path": "incoming", "patient_id": "PAT1", "timepoint_id": patients[0]["timepoints"][0]["id"]})
+    assert opened.status_code == 200, opened.text
+    body = opened.json()
+    assert body["patient_count"] == 2 and body["timepoint_count"] == 2
+    assert body["next_patient"]["patient_id"] == "PAT2"
+    assert body["next_timepoint"]["patient_id"] == "PAT1"
+    again = admin.post("/api/projects/lung-ct/local-catalog/open", json={
+        "path": "incoming", "patient_id": "PAT1", "timepoint_id": patients[0]["timepoints"][0]["id"]})
+    assert again.status_code == 200, again.text
+    assert again.json()["study_id"] == body["study_id"]
+
+
+def test_local_folder_import_reads_dicom_inside_data(clients):
+    admin, _, _ = clients
+    root = Path(os.environ["APP_STORAGE_ROOT"])
+    _write_ct_series(root / "incoming" / "series", "LOCAL-1", "1.2.3.4.5.6")
+    assert admin.post("/api/projects/lung-ct/import-folder", json={"path": "../outside", "deidentified": True}).status_code == 422
+    assert admin.post("/api/projects/lung-ct/import-folder", json={"path": "incoming", "deidentified": False}).status_code == 422
+    started = admin.post("/api/projects/lung-ct/import-folder", json={"path": "incoming", "deidentified": True})
+    assert started.status_code == 202, started.text
+    status = {}
+    for _ in range(100):
+        status = admin.get("/api/projects/lung-ct/import-folder").json()
+        if status["state"] != "running":
+            break
+        time.sleep(0.05)
+    assert status["state"] == "done", status
+    assert status["imported"] == 1
+    again = admin.post("/api/projects/lung-ct/import-folder", json={"path": "incoming", "deidentified": True})
+    assert again.status_code == 202
+    for _ in range(100):
+        status = admin.get("/api/projects/lung-ct/import-folder").json()
+        if status["state"] != "running":
+            break
+        time.sleep(0.05)
+    assert status["imported"] == 0, status
 
 
 def test_import_limits_and_valid_mri(clients):

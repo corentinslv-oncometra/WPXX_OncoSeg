@@ -1,7 +1,7 @@
 {
   "app/__init__.py": {
-    "mtime": 1790671623.4720385,
-    "seen": 1791450050.9717004,
+    "mtime": 1790671623.472,
+    "seen": 1792138085.2141042,
     "ast_hash": "d41d8cd98f00b204e9800998ecf8427e",
     "semantic_hash": ""
   },
@@ -42,9 +42,9 @@
     "semantic_hash": ""
   },
   "app/oncometra.py": {
-    "mtime": 1791460194.2345662,
-    "seen": 1791460538.3445642,
-    "ast_hash": "5d882b568dd7036d4845532e6531019e",
+    "mtime": 1792143461.7342312,
+    "seen": 1792143640.6413453,
+    "ast_hash": "a44d5ce16ed9a102ae52de7780f2a9c7",
     "semantic_hash": ""
   },
   "app/oncometra_models.py": {
@@ -72,8 +72,8 @@
     "semantic_hash": ""
   },
   "app/services/__init__.py": {
-    "mtime": 1790671623.484892,
-    "seen": 1791450050.9717193,
+    "mtime": 1790671623.484,
+    "seen": 1792138085.214129,
     "ast_hash": "d41d8cd98f00b204e9800998ecf8427e",
     "semantic_hash": ""
   },
@@ -216,9 +216,9 @@
     "semantic_hash": ""
   },
   "app/static/oncometra.js": {
-    "mtime": 1791469025.7553966,
-    "seen": 1791469051.9253724,
-    "ast_hash": "ce936d6a6ca305741c4d9e108e0923b5",
+    "mtime": 1792156427.7458112,
+    "seen": 1792156491.3706245,
+    "ast_hash": "c54bb588691a70289697496cc7fb9d73",
     "semantic_hash": ""
   },
   "app/static/platform-workspace.mjs": {
@@ -288,9 +288,9 @@
     "semantic_hash": ""
   },
   "tests/test_oncometra.py": {
-    "mtime": 1791453042.8319528,
-    "seen": 1791453130.2572582,
-    "ast_hash": "626915fcba66aa7979d750595cb70b34",
+    "mtime": 1792144669.6546202,
+    "seen": 1792144707.7465837,
+    "ast_hash": "7be5de5fbd771da99f859d6db158ccfc",
     "semantic_hash": ""
   },
   "tests/test_platform.py": {
@@ -324,9 +324,9 @@
     "semantic_hash": ""
   },
   "app/static/oncometra.html": {
-    "mtime": 1791469025.7142243,
-    "seen": 1791469051.9254668,
-    "ast_hash": "af2257af789505e106f55e6a3d7b26eb",
+    "mtime": 1792156427.7430174,
+    "seen": 1792156491.3706584,
+    "ast_hash": "a2d15169d76a5fa8513bf04eb2a01e9f",
     "semantic_hash": ""
   },
   "demo-cases/README.md": {
@@ -366,15 +366,51 @@
     "semantic_hash": ""
   },
   "requirements-demo.txt": {
-    "mtime": 1791452974.2323737,
-    "seen": 1791453130.2572744,
-    "ast_hash": "a9f3752b1fe6e20403fa455326648f38",
+    "mtime": 1792140591.4706826,
+    "seen": 1792141062.0357544,
+    "ast_hash": "8cb3520d7eeb417794b1c5529c9d4cbd",
     "semantic_hash": ""
   },
   "requirements.txt": {
     "mtime": 1791288711.9509785,
     "seen": 1791450050.971779,
     "ast_hash": "6c4db882a01715f4b0747684c522a0a6",
+    "semantic_hash": ""
+  },
+  "app/services/local_dicom_import.py": {
+    "mtime": 1792143461.3006105,
+    "seen": 1792143640.6413648,
+    "ast_hash": "b3739add7ae10790b5f95e8412286004",
+    "semantic_hash": ""
+  },
+  "app/services/dicom_seg.py": {
+    "mtime": 1792143432.2336144,
+    "seen": 1792143640.6413584,
+    "ast_hash": "9fbab77a620ca75cfffeb701433ecf38",
+    "semantic_hash": ""
+  },
+  "app/services/exam_autoseg.py": {
+    "mtime": 1792141408.8663278,
+    "seen": 1792141776.9256792,
+    "ast_hash": "4aea75a58ca151641398a7d6237469f2",
+    "semantic_hash": ""
+  },
+  "app/services/ts_class_map.py": {
+    "mtime": 1792141408.8663278,
+    "seen": 1792141776.9257162,
+    "ast_hash": "48f152a34e7202033243d15e59d92455",
+    "semantic_hash": ""
+  },
+  "scripts/run_one_hcc_autoseg.py": {
+    "mtime": 1792141425.5372486,
+    "seen": 1792141776.9257681,
+    "ast_hash": "18a7da30cf2c1bdc9b9e839ed67d9c6a",
+    "semantic_hash": ""
+  },
+  "requirements-totalseg.txt": {
+    "mtime": 1792141707.240694,
+    "seen": 1792141776.9258058,
+    "ast_hash": "36eaf4b8dcf798a2bb6a2294c6fc2c12",
     "semantic_hash": ""
   }
 }
