@@ -15,3 +15,4 @@ data/models/
 admin-password.txt
 demo-cases/*/archive-index.json
 demo-cases/*/source-*.nii.gz
+graphify-out/
