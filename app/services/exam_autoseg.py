@@ -1,22 +1,28 @@
 """Organ HU and, when no tumor SEG exists, a cancer-specific lesion mask.
 
-TotalSegmentator runs on the CPU in its own environment. Results are stored
-per series before the exam is opened, so the validation page only displays
-work that is already finished.
+TotalSegmentator runs on the CPU in its own environment. A reader can start it
+for the open exam; the validation page never launches it for a whole cohort.
 """
 
 from __future__ import annotations
 
+from functools import lru_cache
 import json
+import logging
 from pathlib import Path
 import subprocess
+import threading
 
 import numpy as np
 import SimpleITK as sitk
 
 from app.services.storage import DATA_ROOT
 
+logger = logging.getLogger(__name__)
 ORGAN_TASK = "total"
+_status_lock = threading.Lock()
+_status: dict[str, dict] = {}
+_active_case: str | None = None
 # Open tasks only. Kidney cysts are not a tumor model and are intentionally absent.
 _LESION_TASKS = (
     (("hepatocellular", "hepat", "liver", "hcc"), "liver_lesions", ("lesion", "tumor")),
@@ -91,6 +97,7 @@ def totalseg_cli() -> Path:
     raise FileNotFoundError("La commande TotalSegmentator est introuvable.")
 
 
+@lru_cache(maxsize=4)
 def class_names(task: str) -> dict[int, str]:
     script = Path(__file__).resolve().parent / "ts_class_map.py"
     completed = subprocess.run(
@@ -154,3 +161,199 @@ def attach_stored_result(case_id: str) -> None:
         if row is not None:
             row.source = source
             db.commit()
+
+
+def organ_color(label_id: int) -> list[int]:
+    """Stable distinct color. The same TotalSegmentator label keeps the same hue."""
+    hue = (float(label_id) * 137.508) % 360.0
+    saturation, value = 0.72, 0.95
+    chroma = value * saturation
+    match = chroma * (1 - abs((hue / 60.0) % 2 - 1))
+    base = value - chroma
+    sector = int(hue // 60) % 6
+    red, green, blue = (
+        (chroma, match, 0.0), (match, chroma, 0.0), (0.0, chroma, match),
+        (0.0, match, chroma), (match, 0.0, chroma), (chroma, 0.0, match),
+    )[sector]
+    return [int(round((channel + base) * 255)) for channel in (red, green, blue)]
+
+
+def run_totalseg(task: str, source: Path, output: Path, *, fast: bool) -> None:
+    command = [str(totalseg_cli()), "-i", str(source), "-o", str(output), "-ta", task,
+               "--ml", "--statistics", "--statistics_extra", "--device", "cpu"]
+    if fast:
+        command.append("--fast")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode:
+        lines = [line.strip() for line in (completed.stderr or completed.stdout or "").splitlines() if line.strip()]
+        detail = lines[-1][:240] if lines else f"code {completed.returncode}"
+        raise RuntimeError(f"TotalSegmentator a échoué ({task}) : {detail}")
+
+
+def detection_status(case_id: str) -> dict:
+    with _status_lock:
+        current = _status.get(case_id)
+        if current:
+            return dict(current)
+    return {"state": "idle", "detail": "", "error": "", "seeded": False}
+
+
+def _set_status(case_id: str, **fields) -> None:
+    with _status_lock:
+        current = dict(_status.get(case_id) or {"state": "idle", "detail": "", "error": "", "seeded": False})
+        current.update(fields)
+        _status[case_id] = current
+
+
+def start_detection(case_id: str, study_id: str) -> dict:
+    global _active_case
+    with _status_lock:
+        active = _status.get(_active_case or "", {})
+        if _active_case and _active_case != case_id and active.get("state") == "running":
+            raise RuntimeError("Une détection est déjà en cours sur un autre examen.")
+        current = _status.get(case_id) or {}
+        if current.get("state") == "running":
+            return dict(current)
+        _active_case = case_id
+        _status[case_id] = {"state": "running", "detail": "Préparation de l’examen…", "error": "", "seeded": False}
+    threading.Thread(target=_detect_worker, args=(case_id, study_id), daemon=True).start()
+    return detection_status(case_id)
+
+
+def _detect_worker(case_id: str, study_id: str) -> None:
+    global _active_case
+    try:
+        result = execute_case(case_id, study_id, report=_set_status)
+        _set_status(case_id, state="done", detail=result["detail"], error="", seeded=result["seeded"])
+    except Exception as error:
+        logger.exception("Automatic detection failed for %s", case_id)
+        _set_status(case_id, state="error", detail="", error=str(error), seeded=False)
+    finally:
+        with _status_lock:
+            if _active_case == case_id:
+                _active_case = None
+
+
+def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
+    """Segment one exam. An existing organ file is reused instead of running twice."""
+    from app.db import SessionLocal
+    from app.oncometra_models import WorkspaceCase, WorkspaceProject
+
+    runner = runner or run_totalseg
+    report = report or (lambda _case, **_fields: None)
+    with SessionLocal() as db:
+        case = db.get(WorkspaceCase, case_id)
+        if case is None:
+            raise RuntimeError("Examen introuvable.")
+        project = db.get(WorkspaceProject, case.project_id)
+        source = dict(case.source or {})
+        cancer = project.cancer_origin if project else ""
+    folder = DATA_ROOT / "workspace" / "cases" / case_id
+    image_path = folder / "image.nii.gz"
+    if not image_path.is_file():
+        raise RuntimeError("Le volume de cet examen est introuvable.")
+    image = sitk.ReadImage(str(image_path))
+    uid = str(source.get("series_instance_uid") or case_id)
+    stored = series_result_dir(uid)
+    stored.mkdir(parents=True, exist_ok=True)
+    report(case_id, state="running", detail="Segmentation des organes…")
+    organs_path = stored / "organs.nii.gz"
+    if not organs_path.is_file():
+        runner(ORGAN_TASK, image_path, organs_path, fast=True)
+    names = class_names(ORGAN_TASK)
+    labels = sitk.GetArrayFromImage(on_reference_grid(image, sitk.ReadImage(str(organs_path))))
+    labels = np.rint(labels).astype(np.uint16)
+    spacing = image.GetSpacing()
+    voxel_mm3 = float(spacing[0] * spacing[1] * spacing[2])
+    organ_labels = labels
+    present = [int(value) for value in np.unique(organ_labels) if int(value) > 0]
+    legend = [{"id": label_id, "name": names.get(label_id, f"label_{label_id}"),
+               "label": names.get(label_id, f"Label {label_id}").replace("_", " "),
+               "color": organ_color(label_id)} for label_id in present]
+    tumor_task = None
+    tumor_note = "Fichier SEG déjà utilisé pour la tumeur."
+    seeded = False
+    lesion_mask = None
+    if not source.get("seg_used") and not source.get("tumor_from_seg"):
+        chosen = lesion_task_for_cancer(cancer)
+        if chosen is None:
+            tumor_note = "Aucun modèle ouvert de lésion ne correspond à ce type de cancer."
+        else:
+            tumor_task, needles = chosen
+            report(case_id, state="running", detail="Segmentation des lésions…")
+            lesions_path = stored / "lesions.nii.gz"
+            if not lesions_path.is_file():
+                try:
+                    runner(tumor_task, image_path, lesions_path, fast=False)
+                except Exception as error:
+                    tumor_note = f"Organes prêts. La détection des lésions a échoué : {error}"
+                    lesions_path = None
+            if lesions_path and lesions_path.is_file():
+                lesion_names = class_names(tumor_task)
+                lesion_labels = np.rint(sitk.GetArrayFromImage(on_reference_grid(
+                    image, sitk.ReadImage(str(lesions_path))))).astype(np.uint16)
+                mask = binary_labels(lesion_labels, lesion_names, needles)
+                if int(mask.sum()):
+                    lesion_mask = mask
+                    tumor = sitk.GetImageFromArray(mask.astype(np.uint8))
+                    tumor.CopyInformation(image)
+                    sitk.WriteImage(tumor, str(stored / "tumor.nii.gz"), True)
+                    reference = folder / "reference.nii.gz"
+                    if not reference.exists():
+                        sitk.WriteImage(tumor, str(reference), True)
+                        seeded = _seed_detected_tumor(study_id, reference)
+                    tumor_note = f"Lésions proposées par {tumor_task}."
+                    if not seeded and reference.exists():
+                        tumor_note += " Le brouillon déjà commencé n’a pas été remplacé."
+                else:
+                    tumor_note = f"La tâche {tumor_task} n’a trouvé aucune lésion."
+    if lesion_mask is not None:
+        labels = organ_labels.copy()
+        labels[lesion_mask > 0] = np.uint16(65000)
+        legend.append({"id": 65000, "name": "lesion", "label": "Lésion", "color": [220, 0, 0]})
+    volume = sitk.GetImageFromArray(labels)
+    volume.CopyInformation(image)
+    sitk.WriteImage(volume, str(folder / "organ_labels.nii.gz"), True)
+    report(case_id, state="running", detail="Calcul des unités Hounsfield…")
+    payload = {
+        "cancer": cancer, "organ_task": ORGAN_TASK, "organ_mode": "fast", "device": "cpu",
+        "tumor_task": tumor_task, "tumor_note": tumor_note, "legend": legend,
+        "organs": hu_rows(sitk.GetArrayFromImage(image), organ_labels, names, voxel_mm3),
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    (folder / "organs.json").write_text(text, encoding="utf-8")
+    (stored / "hu.json").write_text(text, encoding="utf-8")
+    detail = f"{len(present)} organes colorés. {tumor_note}"
+    return {"detail": detail, "seeded": seeded}
+
+
+def _seed_detected_tumor(study_id: str, reference: Path) -> bool:
+    from app.db import SessionLocal
+    from app.oncometra import _seed_tumor_overlay
+    from app.oncometra_models import WorkspaceUser
+    from app.models import AnnotationHead
+
+    with SessionLocal() as db:
+        head = db.get(AnnotationHead, study_id)
+        if head is None or head.revision_id or not reference.is_file():
+            return False
+        from app.oncometra_models import WorkspaceAssignment
+        assignment = db.get(WorkspaceAssignment, study_id)
+        if assignment is None:
+            return False
+        user = db.get(WorkspaceUser, assignment.user_id)
+        if user is None:
+            return False
+        _seed_tumor_overlay(db, study_id, reference, user)
+        db.commit()
+        head = db.get(AnnotationHead, study_id)
+        return bool(head and head.revision_id)
+
+
+def organ_overlay(case_dir: Path) -> dict | None:
+    table = load_organ_table(case_dir)
+    labels = case_dir / "organ_labels.nii.gz"
+    if not table or not labels.is_file() or not table.get("legend"):
+        return None
+    return {"legend": table["legend"], "encoding": "uint16-le", "tumor_note": table.get("tumor_note") or ""}

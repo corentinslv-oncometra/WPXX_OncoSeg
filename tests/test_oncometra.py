@@ -341,6 +341,9 @@ def test_cancer_type_selects_lesion_task_and_organ_hu():
     labels[0] = 1
     rows = hu_rows(ct, labels, {1: "liver"}, 1.0)
     assert rows[0]["voxels"] == 8 and rows[0]["hu_min"] == 0 and rows[0]["hu_max"] == 7
+    from app.services.exam_autoseg import organ_color
+    assert organ_color(1) != organ_color(2) and organ_color(5) == organ_color(5)
+    assert all(0 <= channel <= 255 for channel in organ_color(12))
     mask = binary_labels(np.array([[[1, 2]]], np.uint8), {1: "liver_lesions", 2: "liver_vessels"}, ("lesion", "tumor"))
     assert int(mask.sum()) == 1 and mask[0, 0, 0] == 1 and mask[0, 0, 1] == 0
 
@@ -460,3 +463,48 @@ def test_import_limits_and_valid_mri(clients):
     assert reader.post('/api/import',data={'project_id':'brain-mr','patient_id':'UPLOADED-MR','deidentified':'false'},files={'files':('image.nii.gz',payload)}).status_code==422
     result=reader.post('/api/import',data={'project_id':'brain-mr','patient_id':'UPLOADED-MR','deidentified':'true'},files={'files':('image.nii.gz',payload)})
     assert result.status_code==422
+
+
+def test_one_exam_detection_publishes_distinct_organ_colors(clients, monkeypatch):
+    import gzip
+    from app.services import exam_autoseg
+    admin, _, _ = clients
+    case = fixture_case()
+    study = assigned(admin, case)
+    calls = []
+
+    def runner(task, source, output, *, fast):
+        calls.append((task, fast))
+        image = sitk.ReadImage(str(source))
+        labels = np.zeros(tuple(reversed(image.GetSize())), np.uint16)
+        labels[0, 0, :16] = 1
+        labels[0, 1, :16] = 2
+        painted = sitk.GetImageFromArray(labels)
+        painted.CopyInformation(image)
+        sitk.WriteImage(painted, str(output), True)
+
+    monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver", 2: "spleen"} if task == "total" else {1: "lung_nodule"})
+    result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
+    assert calls == [("total", True), ("lung_nodules", False)]
+    assert result["detail"].startswith("2 organes colorés")
+    overlay = admin.get(f"/api/studies/{study}/organ-overlay")
+    assert overlay.status_code == 200, overlay.text
+    legend = overlay.json()["legend"]
+    assert [item["label"] for item in legend] == ["liver", "spleen", "Lésion"]
+    assert legend[0]["color"] != legend[1]["color"]
+    assert legend[2]["color"] == [220, 38, 38]
+    voxels = admin.get(f"/api/studies/{study}/organ-overlay/voxels")
+    assert voxels.status_code == 200
+    payload = voxels.content
+    if payload[:2] == b"\x1f\x8b":
+        payload = gzip.decompress(payload)
+    labels = np.frombuffer(payload, dtype="<u2")
+    assert labels.size == 24 ** 3 and int(labels[0]) == 65000 and int(labels[24]) == 2
+    exam_autoseg._active_case = "busy"
+    exam_autoseg._status["busy"] = {"state": "running", "detail": "", "error": "", "seeded": False}
+    try:
+        refused = admin.post(f"/api/studies/{study}/autoseg")
+        assert refused.status_code == 409
+    finally:
+        exam_autoseg._active_case = None
+        exam_autoseg._status.pop("busy", None)

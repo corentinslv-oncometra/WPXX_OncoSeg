@@ -34,3 +34,7 @@
 .annotation-fullscreen .annotation-page{height:100dvh}
 @media(max-width:1100px){.topbar .connection{display:none}.test-identity select{max-width:230px}.workflow-actions{max-width:57%}}
 @media(max-width:760px){.topbar{gap:7px}.brand-mark{display:none}.brand{font-size:11px;max-width:68px}.test-identity select{max-width:175px;font-size:10px}.topbar .small{padding:7px;font-size:10px}.worklist-filters{flex-wrap:wrap;width:100%}.worklist-filters select{width:100%}.status-summary{padding:0 16px 14px;gap:5px}.status-badge{font-size:10px;padding:5px 7px}.workflow-actions{max-width:none}.workflow-steps{font-size:10px;gap:9px}.case-table td:last-child button{display:block;width:100%;margin-left:0}.case-table td:last-child button+button{margin:5px 0 0}}
+.slice-bar{position:relative}
+.slice-bar input{position:relative;z-index:1}
+.tumor-marks{position:absolute;left:7px;right:7px;top:50%;height:4px;transform:translateY(-50%);pointer-events:none;z-index:2}
+.tumor-marks i{position:absolute;top:-1px;height:6px;min-width:3px;border-radius:2px;background:#e11d48;box-shadow:0 0 0 1px #7f1d1d}

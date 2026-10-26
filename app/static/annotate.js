@@ -29,7 +29,7 @@ const state = {page: "cases", cases: [], id: null, meta: null, volume: null, mas
   window: {width: 1500, level: -600}, epoch: 0, activePlane: "axial", focusedPlane: null,
   editSettings: createEditSettings(), brushHover: null, identity: null,
   selectedNodule: null, jobs: [], runningJobId: null, noduleBoxes: {}, noduleColors: {},
-  hiddenNodules: new Set(), displayVersion: 0};
+  hiddenNodules: new Set(), displayVersion: 0, organs: null, organColors: {}, organNames: {}, soloOrgan: null, organVisible: true};
 let identityId = 'reviewer';
 try {identityId = localStorage.getItem('lung-test-identity') || identityId;} catch {}
 const views = [...document.querySelectorAll(".viewport")].map((node) => ({
@@ -141,6 +141,8 @@ async function openCase(id) {
   state.id = id; state.meta = null; state.volume = null; state.mask = null; state.proposal = null;
   state.preview = false; state.box = null; state.job = null; state.undo = []; state.brushHover = null;
   state.jobs = []; state.runningJobId = null; state.selectedNodule = null;
+  state.organs = null; state.organColors = {}; state.organNames = {}; state.soloOrgan = null;
+  const organHold = $("organ-hold"); if (organHold) organHold.hidden = true;
   state.hiddenNodules = new Set(); state.noduleBoxes = {}; renderNodules();
   $("viewer-empty").hidden = false; $("viewer-empty").querySelector("h2").textContent = "Loading CT volume...";
   showPage("annotate"); updateControls();
@@ -176,6 +178,7 @@ async function openCase(id) {
     const head = meta.history.find((rev) => rev.id === meta.revision_id);
     if (head) state.undo = [head.parent_id];
     $("viewer-empty").hidden = true;
+    loadOrgans().catch(() => {});
     history.replaceState({}, "", `/viewer?study_id=${id}${embedded ? '&embedded=1' : ''}`);
     state.runningJobId = null;
   } catch (error) {
@@ -184,12 +187,105 @@ async function openCase(id) {
   } finally { state.loading = false; updateControls(); renderHistory(); requestRender(); }
 }
 
+async function loadOrgans() {
+  if (!state.id || !state.volume) return;
+  let info;
+  try { info = await json(`/api/studies/${state.id}/organ-overlay`); }
+  catch (error) { if (error.status === 404) return; throw error; }
+  const response = await api(`/api/studies/${state.id}/organ-overlay/voxels`);
+  const labels = new Uint16Array(await response.arrayBuffer());
+  if (!state.volume || labels.length !== state.volume.length) return;
+  state.organs = labels;
+  state.organColors = Object.fromEntries(info.legend.map((item) => [item.id, item.color]));
+  state.organNames = Object.fromEntries(info.legend.map((item) => [item.id, item.label]));
+  state.soloOrgan = null;
+  state.displayVersion++;
+  const chip = $("organ-hold");
+  if (chip) {chip.hidden = true; chip.textContent = "";}
+  if (state.tool === "crosshair") setTool("crosshair");
+  updateTumorMarks();
+  requestRender();
+}
+function isRecordedTumor(nodule) {
+  const name = (nodule.name || "").toLowerCase();
+  const color = nodule.color || [];
+  return name === "tumeur" || name === "tumor" || (color[0] === 220 && color[1] === 38 && color[2] === 38);
+}
+function updateTumorMarks() {
+  const boxes = views.map((view) => view.node.querySelector(".tumor-marks"));
+  if (!state.meta || !state.volume) {boxes.forEach((box) => box && box.replaceChildren()); return;}
+  const [xSize, ySize, zSize] = state.meta.size_xyz;
+  const sagittal = new Uint8Array(xSize), coronal = new Uint8Array(ySize), axial = new Uint8Array(zSize);
+  const tumorLabels = new Set((state.meta.nodules || []).filter(isRecordedTumor).map((nodule) => nodule.label));
+  const organs = state.organs, mask = state.mask;
+  for (let z = 0; z < zSize; z++) {
+    for (let y = 0; y < ySize; y++) {
+      const row = (z * ySize + y) * xSize;
+      for (let x = 0; x < xSize; x++) {
+        const index = row + x;
+        if (!((organs && organs[index] === 65000) || (mask && tumorLabels.has(mask[index])))) continue;
+        sagittal[x] = 1; coronal[y] = 1; axial[z] = 1;
+      }
+    }
+  }
+  const flagsByPlane = {axial, coronal, sagittal};
+  views.forEach((view, index) => {
+    const box = boxes[index];
+    if (!box) return;
+    box.replaceChildren();
+    const flags = flagsByPlane[view.plane];
+    const count = flags.length, max = Math.max(count - 1, 1);
+    const paint = (from, to) => {
+      const mark = document.createElement("i");
+      const span = Math.max((to - from) / max * 100, 100 / count);
+      let left = from / max * 100;
+      if (left + span > 100) left = 100 - span;
+      mark.style.left = `${left}%`;
+      mark.style.width = `${span}%`;
+      mark.title = from === to ? `Coupe ${from + 1}` : `Coupes ${from + 1}–${to + 1}`;
+      box.append(mark);
+    };
+    let start = -1;
+    for (let i = 0; i < count; i++) {
+      if (flags[i] && start < 0) start = i;
+      else if (!flags[i] && start >= 0) {paint(start, i - 1); start = -1;}
+    }
+    if (start >= 0) paint(start, count - 1);
+  });
+}
+let organHoldToken = 0, organHoldScreen = null;
+function cancelOrganHold() { organHoldToken++; organHoldScreen = null; }
+function armOrganHold(view, point, event) {
+  cancelOrganHold();
+  if (!state.organs || !state.organVisible || state.tool !== "crosshair") return;
+  const xyz = point3(view.plane, ...point.map(Math.round));
+  const label = state.organs[offset(xyz[0], xyz[1], xyz[2])] || 0;
+  const token = ++organHoldToken;
+  organHoldScreen = [event.clientX, event.clientY];
+  setTimeout(() => {
+    if (token !== organHoldToken) return;
+    organHoldToken++;
+    const next = !label || state.soloOrgan === label ? null : label;
+    if (next === state.soloOrgan) return;
+    state.soloOrgan = next;
+    state.displayVersion++;
+    const chip = $("organ-hold");
+    const name = state.organNames[state.soloOrgan] || "Organe";
+    if (chip) {
+      chip.hidden = !state.soloOrgan;
+      chip.textContent = state.soloOrgan ? `${name} seul — maintenez 3 s pour réafficher les autres` : "";
+    }
+    notify(state.soloOrgan ? `${name} seul.` : "Tous les organes sont de nouveau affichés.");
+    requestRender();
+  }, 3000);
+}
 async function loadMask() {
   const mask = state.meta.revision_id
     ? new Uint8Array(await (await api(`${base()}/mask?revision_id=${state.meta.revision_id}`)).arrayBuffer())
     : new Uint8Array(state.volume.length);
   if (state.volume && mask.length !== state.volume.length) throw new Error("Mask transfer size mismatch");
   state.mask = mask;
+  updateTumorMarks();
 }
 async function reloadDraft() {
   state.meta = await json(base());
@@ -336,10 +432,13 @@ function renderView(view) {
   const overlay = state.preview ? state.proposal : state.mask;
   const targetLabel = state.preview ? jobNoduleLabel(state.job) : null;
   const colors = {...state.noduleColors, 256: [255, 102, 94], 257: [245, 186, 85]};
+  const tumorRed = [220, 0, 0];
+  const tumorLabels = new Set((state.meta?.nodules || []).filter(isRecordedTumor).map((nodule) => nodule.label));
   const opacity = state.overlay ? Number($("overlay-opacity").value) : 0;
   const low = state.window.level - state.window.width / 2;
   const rasterKey = [state.volume, state.mask, overlay, opacity, low, state.window.width, slice,
-    state.preview, targetLabel, state.selectedNodule, state.displayVersion, signX, signY];
+    state.preview, targetLabel, state.selectedNodule, state.displayVersion, signX, signY,
+    state.organs, state.soloOrgan, state.organVisible];
   // Zoom, pan and crosshair changes reuse the raster instead of windowing every voxel again.
   if (!view.rasterKey || rasterKey.some((value, i) => value !== view.rasterKey[i])) {
     source.width = width; source.height = height;
@@ -350,9 +449,25 @@ function renderView(view) {
       const index = offset(x, y, z), p = (v * width + u) * 4;
       const value = Math.max(0, Math.min(255, (state.volume[index] - low) * 255 / state.window.width));
       const label = previewLabel(state.mask?.[index] || 0, state.preview && overlay?.[index], targetLabel);
-      const color = colors[label] || [104, 237, 182];
-      const alpha = !label || state.hiddenNodules.has(label) ? 0 : opacity * (label === state.selectedNodule || label > 255 ? 1 : .65);
-      for (let c = 0; c < 3; c++) pixels.data[p + c] = value * (1 - alpha) + color[c] * alpha;
+      const color = tumorLabels.has(label) ? tumorRed : (colors[label] || [104, 237, 182]);
+      const alpha = !label || state.hiddenNodules.has(label) ? 0 : tumorLabels.has(label) ? (state.overlay ? 1 : 0) : opacity * (label === state.selectedNodule || label > 255 ? 1 : .65);
+      const organ = state.organs ? state.organs[index] : 0;
+      const organIsTumor = organ === 65000;
+      const showOrgan = state.organVisible && organ && (!state.soloOrgan || organ === state.soloOrgan);
+      const organColor = showOrgan ? (organIsTumor ? tumorRed : state.organColors[organ]) : null;
+      const organAlpha = organColor ? (organIsTumor ? 1 : state.soloOrgan ? .62 : .42) : 0;
+      let red = value, green = value, blue = value;
+      if (organAlpha) {
+        red = value * (1 - organAlpha) + organColor[0] * organAlpha;
+        green = value * (1 - organAlpha) + organColor[1] * organAlpha;
+        blue = value * (1 - organAlpha) + organColor[2] * organAlpha;
+      }
+      if (alpha) {
+        red = red * (1 - alpha) + color[0] * alpha;
+        green = green * (1 - alpha) + color[1] * alpha;
+        blue = blue * (1 - alpha) + color[2] * alpha;
+      }
+      pixels.data[p] = red; pixels.data[p + 1] = green; pixels.data[p + 2] = blue;
       pixels.data[p + 3] = 255;
     }
     bctx.putImageData(pixels, 0, 0);
@@ -424,7 +539,7 @@ function setTool(tool) {
   state.tool = tool; state.brushHover = null;
   document.querySelectorAll("[data-tool]").forEach((el) => {el.classList.toggle("active", el.dataset.tool === tool); el.setAttribute("aria-pressed", el.dataset.tool === tool);});
   views.forEach((view) => view.canvas.style.cursor = tool === "pan" ? "grab" : tool === "zoom" ? "zoom-in" : "crosshair");
-  $("interaction-hint").textContent = {brush: "Paint: add voxels | Pinch: zoom | Cmd/Ctrl+Z: undo", erase: "Paint: remove voxels | Pinch: zoom | Cmd/Ctrl+Z: undo", pan: "Drag: pan | Pinch: zoom | Double-click: focus/restore", zoom: "Drag up/down or scroll: zoom | +/-: zoom selected view | Fit: reset", crosshair: "Double-click: focus/restore | Pinch: zoom | Scroll: slice | Cmd/Ctrl+Z: undo"}[tool];
+  $("interaction-hint").textContent = {brush: "Paint: add voxels | Pinch: zoom | Cmd/Ctrl+Z: undo", erase: "Paint: remove voxels | Pinch: zoom | Cmd/Ctrl+Z: undo", pan: "Drag: pan | Pinch: zoom | Double-click: focus/restore", zoom: "Drag up/down or scroll: zoom | +/-: zoom selected view | Fit: reset", crosshair: state.organs ? "Maintenez 3 s sur un organe pour ne garder que sa couleur." : "Double-click: focus/restore | Pinch: zoom | Scroll: slice | Cmd/Ctrl+Z: undo"}[tool];
   updateControls(); requestRender();
 }
 function isEditTool() {return ["brush", "erase"].includes(state.tool);}
@@ -496,7 +611,7 @@ for (const view of views) {
     view.lastClick = {time: event.timeStamp, x: event.clientX, y: event.clientY};
     // PointerEvent.detail is zero in some browsers; identify the second click before a dot can be saved.
     if (event.detail >= 2 || (previousClick && event.timeStamp - previousClick.time < 600 &&
-      Math.hypot(event.clientX - previousClick.x, event.clientY - previousClick.y) < 5)) {cancelPendingPoint(); return;}
+      Math.hypot(event.clientX - previousClick.x, event.clientY - previousClick.y) < 5)) {cancelPendingPoint(); cancelOrganHold(); return;}
     if (!state.volume || state.busy || state.loading || event.button !== 0) return;
     if (state.meta?.confirmation && ["box", "brush", "erase"].includes(state.tool)) return notify("Reopen the case before editing.");
     if (!activeNodule() && ["box", "brush", "erase"].includes(state.tool)) return;
@@ -507,11 +622,12 @@ for (const view of views) {
     view.drag = {start: point, screen: [event.clientX, event.clientY], pan: [...view.pan], zoom: view.zoom, tool: state.tool,
       noduleLabel: state.selectedNodule, previousBox: state.box, slice: state.cross[axes(view.plane)[2]]};
     if (isEditTool()) {view.drag.points = [point]; view.drag.spec = strokeSpec(state.tool, state.editSettings); state.brushHover = {plane: view.plane, center: point3(view.plane, ...point)};}
-    if (state.tool === "crosshair") state.cross = point3(view.plane, ...point.map(Math.round));
+    if (state.tool === "crosshair") {state.cross = point3(view.plane, ...point.map(Math.round)); armOrganHold(view, point, event);}
     if (state.tool === "box") state.box = {plane: view.plane, frame_index: view.drag.slice, box_xyxy: [...point, ...point]};
     requestRender(); updateControls();
   });
   view.canvas.addEventListener("pointermove", (event) => {
+    if (organHoldScreen && Math.hypot(event.clientX - organHoldScreen[0], event.clientY - organHoldScreen[1]) > 4) cancelOrganHold();
     if (state.volume && isEditTool() && !state.preview && !state.meta?.confirmation && !state.busy) {
       const hover = pixel(view, event);
       state.brushHover = hover ? {plane: view.plane, center: point3(view.plane, ...hover)} : null;
@@ -530,6 +646,7 @@ for (const view of views) {
     requestRender();
   });
   view.canvas.addEventListener("pointerup", task(async (event) => {
+    cancelOrganHold();
     const drag = view.drag; if (!drag) return;
     if (view.canvas.hasPointerCapture(event.pointerId)) view.canvas.releasePointerCapture(event.pointerId);
     view.drag = null;
@@ -743,6 +860,8 @@ $("zoom-in").addEventListener("click", () => zoomView(views.find((v) => v.plane 
 $("zoom-out").addEventListener("click", () => zoomView(views.find((v) => v.plane === state.activePlane), 1 / 1.25));
 function toggleOverlay() {state.overlay = !state.overlay; $("toggle-overlay").classList.toggle("active", state.overlay); requestRender();}
 $("toggle-overlay").addEventListener("click", toggleOverlay);
+function toggleOrgans() {state.organVisible = !state.organVisible; $("toggle-organs").classList.toggle("active", state.organVisible); if (!state.organVisible) {state.soloOrgan = null; const chip = $("organ-hold"); if (chip) chip.hidden = true;} requestRender();}
+$("toggle-organs").addEventListener("click", toggleOrgans);
 $("toggle-inspector").addEventListener("click", () => {const hidden = $("annotation-layout").classList.toggle("no-inspector"); $("toggle-inspector").setAttribute("aria-expanded", !hidden); requestRender();});
 if (innerWidth <= 760) {$("annotation-layout").classList.add("no-inspector"); $("toggle-inspector").setAttribute("aria-expanded", "false");}
 $("export-mask").addEventListener("click", task(() => openExport(state.id)));
@@ -932,4 +1051,11 @@ $("test-identity").addEventListener('change', task(async () => {
     identityId = previousId; state.identity = previousActor; $("test-identity").value = previousId; throw error;
   } finally {state.busy = false; updateControls();}
 }));
+window.addEventListener("message", (event) => {
+  if (event.origin !== location.origin || event.data?.type !== "oncometra:load-organs") return;
+  task(async () => {
+    if (event.data.seeded) await reloadDraft();
+    await loadOrgans();
+  })();
+});
 task(init)();

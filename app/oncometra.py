@@ -732,6 +732,49 @@ def study_organs(study_id: UUID, user=Depends(current_user)):
     return payload
 
 
+@app.post("/api/studies/{study_id}/autoseg", status_code=202)
+def start_study_autoseg(study_id: UUID, user=Depends(current_user)):
+    from app.services.exam_autoseg import start_detection
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        case_id = case.id
+    try:
+        return start_detection(case_id, str(study_id))
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/studies/{study_id}/autoseg")
+def study_autoseg_status(study_id: UUID, user=Depends(current_user)):
+    from app.services.exam_autoseg import detection_status
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        return detection_status(case.id)
+
+
+@app.get("/api/studies/{study_id}/organ-overlay")
+def study_organ_overlay(study_id: UUID, user=Depends(current_user)):
+    from app.services.exam_autoseg import organ_overlay
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        payload = organ_overlay(image_directory(case))
+    if payload is None:
+        raise HTTPException(404, "Cet examen n’a pas encore de carte d’organes.")
+    return payload
+
+
+@app.get("/api/studies/{study_id}/organ-overlay/voxels")
+def study_organ_voxels(study_id: UUID, user=Depends(current_user)):
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        path = image_directory(case) / "organ_labels.nii.gz"
+    if not path.is_file():
+        raise HTTPException(404, "Cet examen n’a pas encore de carte d’organes.")
+    labels = np.ascontiguousarray(sitk.GetArrayFromImage(sitk.ReadImage(str(path))).astype("<u2"))
+    return Response(content=gzip.compress(labels.tobytes(), compresslevel=1), media_type="application/octet-stream",
+                    headers={"Content-Encoding": "gzip", "Cache-Control": "no-store"})
+
+
 @app.get("/api/studies/{study_id}/dicom/download")
 def source_dicom(study_id: UUID, user=Depends(current_user)):
     with SessionLocal() as db:

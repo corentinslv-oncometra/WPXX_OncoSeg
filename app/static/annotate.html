@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Oncometra | Annotation</title>
-  <link rel="stylesheet" href="/annotate.css?v=fullscreen-1">
+  <link rel="stylesheet" href="/annotate.css?v=organs-3">
   <link rel="stylesheet" href="/assets/oncometra-viewer.css?v=fullscreen-1">
-  <script type="module" src="/annotate.js?v=fullscreen-1"></script>
+  <script type="module" src="/annotate.js?v=organs-4"></script>
 </head>
 <body>
   <header class="topbar">
@@ -46,6 +46,7 @@
       <button id="reset-view" title="Reset zoom and pan">Fit</button>
       <button id="toggle-mpr" class="active" title="Focus selected view or restore all planes; double-click a view to toggle">Focus view</button>
       <button id="toggle-overlay" class="active" title="Toggle mask visibility (M)">Mask</button>
+      <button id="toggle-organs" class="active" title="Afficher ou masquer les couleurs de la détection automatique">Organes</button>
       <span class="top-spacer"></span><span id="save-state" class="save-state">No draft</span>
       <button id="export-mask" disabled>Export case</button>
       <button id="toggle-inspector" aria-expanded="true" title="Show or hide the inspector">Inspector</button>
@@ -82,9 +83,9 @@
         <button id="undo" disabled title="Undo the last edit (Ctrl/Cmd+Z)"><svg viewBox="0 0 24 24"><path d="M8 5 3 10l5 5M3 10h11a6 6 0 0 1 0 12"/></svg><span>Undo</span></button>
       </aside>
       <section id="viewports" class="viewports" aria-label="Linked CT views">
-        <div class="viewport axial" data-plane="axial"><div class="viewport-label"><b>AXIAL</b><span class="plane-position"></span></div><canvas aria-label="Axial image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><input type="range" min="0" value="0" aria-label="Axial slice"></div></div>
-        <div class="viewport coronal" data-plane="coronal"><div class="viewport-label"><b>CORONAL</b><span class="plane-position"></span></div><canvas aria-label="Coronal CT image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><input type="range" min="0" value="0" aria-label="Coronal slice"></div></div>
-        <div class="viewport sagittal" data-plane="sagittal"><div class="viewport-label"><b>SAGITTAL</b><span class="plane-position"></span></div><canvas aria-label="Sagittal CT image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><input type="range" min="0" value="0" aria-label="Sagittal slice"></div></div>
+        <div class="viewport axial" data-plane="axial"><div class="viewport-label"><b>AXIAL</b><span class="plane-position"></span></div><canvas aria-label="Axial image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><div class="slice-bar"><input type="range" min="0" value="0" aria-label="Axial slice"><div class="tumor-marks" title="Coupes où une tumeur est signalée"></div></div></div></div>
+        <div class="viewport coronal" data-plane="coronal"><div class="viewport-label"><b>CORONAL</b><span class="plane-position"></span></div><canvas aria-label="Coronal CT image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><div class="slice-bar"><input type="range" min="0" value="0" aria-label="Coronal slice"><div class="tumor-marks" title="Coupes où une tumeur est signalée"></div></div></div></div>
+        <div class="viewport sagittal" data-plane="sagittal"><div class="viewport-label"><b>SAGITTAL</b><span class="plane-position"></span></div><canvas aria-label="Sagittal CT image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><div class="slice-bar"><input type="range" min="0" value="0" aria-label="Sagittal slice"><div class="tumor-marks" title="Coupes où une tumeur est signalée"></div></div></div></div>
         <div id="viewer-empty" class="viewer-empty"><h2>No CT selected</h2><p>Select a CT series from the worklist.</p><button data-page="cases">Open worklist</button></div>
       </section>
       <aside id="inspector" class="inspector">
@@ -100,7 +101,7 @@
         <details class="inspector-section"><summary>Image geometry</summary><div id="geometry-info" class="fine-print"></div></details>
       </aside>
     </div>
-    <footer class="viewer-footer"><span id="interaction-hint">Double-click: focus/restore | Pinch: zoom | Scroll: slice | Cmd/Ctrl+Z: undo</span><span>Native-grid views &middot; Research only &middot; Not for diagnosis</span></footer>
+    <footer class="viewer-footer"><span id="interaction-hint">Double-click: focus/restore | Pinch: zoom | Scroll: slice | Cmd/Ctrl+Z: undo</span><span id="organ-hold" hidden style="color:#f0be63"></span><span>Native-grid views &middot; Research only &middot; Not for diagnosis</span></footer>
   </main>
 
   <dialog id="delete-mask-dialog"><form id="delete-mask-form">

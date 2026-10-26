@@ -1,4 +1,4 @@
-import {platformWorkspace} from '/assets/platform-workspace.mjs?v=cohorts-16';
+import {platformWorkspace} from '/assets/platform-workspace.mjs?v=cohorts-17';
 const $ = id => document.getElementById(id);
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const roleName = value => ({admin:'Administrateur', reviewer:'Radiologue', junior_annotator:'Annotateur', senior_annotator:'Annotateur senior'}[value] || value);
@@ -186,6 +186,7 @@ async function openAssignment(id){
   }
   $('viewer').src=`/viewer?study_id=${id}&embedded=1`;await showTab('annotation');
   renderBrowseNav();
+  watchDetection(id);
 }
 async function renderAdmin(){
   state.users=await api('/api/users');
@@ -243,6 +244,39 @@ for(const [id,key] of [['browse-prev-patient','previous_patient'],['browse-next-
 }
 $('refresh-assignment').onclick=action(async()=>{await refresh(false);await openAssignment(state.assignment.id);});
 function huText(value){return Number(value).toLocaleString('fr-FR',{maximumFractionDigits:1});}
+let detectionTimer=0;
+let detectionSeen='';
+function showDetection(status){
+  const button=$('assignment-detect');
+  button.disabled=status.state==='running';
+  button.textContent=status.state==='running'?'Détection…':'Détecter';
+  button.title=status.error||status.detail||button.dataset.title||'';
+}
+async function watchDetection(id){
+  window.clearTimeout(detectionTimer);
+  if(!state.assignment||state.assignment.id!==id) return;
+  try{
+    const status=await api(`/api/studies/${id}/autoseg`);
+    if(state.assignment?.id!==id) return;
+    showDetection(status);
+    if(status.state==='running') detectionTimer=window.setTimeout(()=>watchDetection(id),4000);
+    if(status.state==='done'){
+      $('viewer').contentWindow?.postMessage({type:'oncometra:load-organs',seeded:!!status.seeded},location.origin);
+      if(detectionSeen==='running') toast(status.detail||'Organes affichés. Maintenez 3 secondes sur un organe pour ne garder que lui.');
+    }
+    if(status.state==='error'&&detectionSeen==='running'&&status.error) toast(status.error,true);
+    detectionSeen=status.state;
+  }catch(error){
+    if(state.assignment?.id===id) $('assignment-detect').title=error.message;
+  }
+}
+$('assignment-detect').onclick=action(async()=>{
+  if(!state.assignment) return;
+  const status=await api(`/api/studies/${state.assignment.id}/autoseg`,{});
+  showDetection(status);
+  toast(status.state==='running'?'Détection lancée pour cet examen seulement. Comptez plusieurs minutes.':'Détection déjà en cours.');
+  watchDetection(state.assignment.id);
+});
 $('assignment-organs').onclick=action(async()=>{
   if(!state.assignment) return;
   const result=await api(`/api/studies/${state.assignment.id}/organs`);
