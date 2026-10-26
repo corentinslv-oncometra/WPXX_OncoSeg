@@ -492,7 +492,7 @@ def test_one_exam_detection_publishes_distinct_organ_colors(clients, monkeypatch
     legend = overlay.json()["legend"]
     assert [item["label"] for item in legend] == ["liver", "spleen", "Lésion"]
     assert legend[0]["color"] != legend[1]["color"]
-    assert legend[2]["color"] == [220, 38, 38]
+    assert legend[2]["color"] == [220, 0, 0]
     voxels = admin.get(f"/api/studies/{study}/organ-overlay/voxels")
     assert voxels.status_code == 200
     payload = voxels.content
@@ -508,3 +508,42 @@ def test_one_exam_detection_publishes_distinct_organ_colors(clients, monkeypatch
     finally:
         exam_autoseg._active_case = None
         exam_autoseg._status.pop("busy", None)
+
+
+def test_detection_keeps_seg_and_still_runs_the_lesion_task(clients, monkeypatch):
+    from app.services import exam_autoseg
+    admin, _, _ = clients
+    case = fixture_case()
+    study = assigned(admin, case)
+    reference = image_directory(case) / "reference.nii.gz"
+    before = reference.read_bytes()
+    with SessionLocal() as db:
+        row = db.get(WorkspaceCase, case.id)
+        source = dict(row.source or {})
+        source["seg_used"] = True
+        source["tumor_from_seg"] = True
+        row.source = source
+        db.commit()
+    calls = []
+
+    def runner(task, source_path, output, *, fast):
+        calls.append((task, fast))
+        image = sitk.ReadImage(str(source_path))
+        labels = np.zeros(tuple(reversed(image.GetSize())), np.uint16)
+        labels[0, 0, 0] = 1
+        painted = sitk.GetImageFromArray(labels)
+        painted.CopyInformation(image)
+        sitk.WriteImage(painted, str(output), True)
+
+    monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver"} if task == "total" else {1: "lung_nodule"})
+    result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
+    assert calls == [("total", True), ("lung_nodules", False)]
+    assert result["seeded"] is False
+    assert "SEG est conservé" in result["detail"]
+    assert reference.read_bytes() == before
+    legend = admin.get(f"/api/studies/{study}/organ-overlay").json()["legend"]
+    assert legend[-1]["id"] == 65000
+    with SessionLocal() as db:
+        source = db.get(WorkspaceCase, case.id).source
+    assert source["tumor_from_seg"] is True
+    assert source.get("tumor_from_model") is not True

@@ -35,7 +35,7 @@ try {identityId = localStorage.getItem('lung-test-identity') || identityId;} cat
 const views = [...document.querySelectorAll(".viewport")].map((node) => ({
   node, plane: node.dataset.plane, canvas: node.querySelector("canvas"),
   slider: node.querySelector("input"), zoom: 1, pan: [0, 0], transform: null,
-  bitmap: document.createElement("canvas"), drag: null,
+  bitmap: document.createElement("canvas"), lesions: document.createElement("canvas"), drag: null,
 }));
 let toastTimer, pollTimer, renderPending = false;
 let pendingPoint = null, pointTimer, pointSave = null;
@@ -204,12 +204,19 @@ async function loadOrgans() {
   if (chip) {chip.hidden = true; chip.textContent = "";}
   if (state.tool === "crosshair") setTool("crosshair");
   updateTumorMarks();
+  updateCompareHint();
   requestRender();
 }
 function isRecordedTumor(nodule) {
   const name = (nodule.name || "").toLowerCase();
   const color = nodule.color || [];
   return name === "tumeur" || name === "tumor" || (color[0] === 220 && color[1] === 38 && color[2] === 38);
+}
+function updateCompareHint() {
+  const hint = $("compare-hint");
+  if (!hint) return;
+  const hasSegment = (state.meta?.nodules || []).some(isRecordedTumor);
+  hint.hidden = !(hasSegment && state.organNames[65000]);
 }
 function updateTumorMarks() {
   const boxes = views.map((view) => view.node.querySelector(".tumor-marks"));
@@ -286,6 +293,7 @@ async function loadMask() {
   if (state.volume && mask.length !== state.volume.length) throw new Error("Mask transfer size mismatch");
   state.mask = mask;
   updateTumorMarks();
+  updateCompareHint();
 }
 async function reloadDraft() {
   state.meta = await json(base());
@@ -433,16 +441,28 @@ function renderView(view) {
   const targetLabel = state.preview ? jobNoduleLabel(state.job) : null;
   const colors = {...state.noduleColors, 256: [255, 102, 94], 257: [245, 186, 85]};
   const tumorRed = [220, 0, 0];
+  const detectedOnly = [0, 188, 255];
+  const agreement = [255, 214, 0];
   const tumorLabels = new Set((state.meta?.nodules || []).filter(isRecordedTumor).map((nodule) => nodule.label));
-  const opacity = state.overlay ? Number($("overlay-opacity").value) : 0;
+  const compare = tumorLabels.size > 0 && Boolean(state.organNames[65000]);
+  const opacityControl = $("overlay-opacity");
+  if (opacityControl && opacityControl.dataset.lesionsOpaque !== "1") {
+    opacityControl.max = "1";
+    opacityControl.value = "1";
+    opacityControl.dataset.lesionsOpaque = "1";
+  }
+  const opacity = state.overlay ? Number(opacityControl.value) : 0;
   const low = state.window.level - state.window.width / 2;
   const rasterKey = [state.volume, state.mask, overlay, opacity, low, state.window.width, slice,
     state.preview, targetLabel, state.selectedNodule, state.displayVersion, signX, signY,
-    state.organs, state.soloOrgan, state.organVisible];
+    state.organs, state.soloOrgan, state.organVisible, compare];
   // Zoom, pan and crosshair changes reuse the raster instead of windowing every voxel again.
   if (!view.rasterKey || rasterKey.some((value, i) => value !== view.rasterKey[i])) {
     source.width = width; source.height = height;
+    const lesions = view.lesions;
+    lesions.width = width; lesions.height = height;
     const bctx = source.getContext("2d"); const pixels = bctx.createImageData(width, height);
+    const lctx = lesions.getContext("2d"); const lesionPixels = lctx.createImageData(width, height);
     for (let v = 0; v < height; v++) for (let u = 0; u < width; u++) {
       let x, y, z; const nativeU = displayX(u), nativeV = displayY(v);
       if (normal === 2) {x = nativeU; y = nativeV; z = slice;} else if (normal === 1) {x = nativeU; y = slice; z = nativeV;} else {x = slice; y = nativeU; z = nativeV;}
@@ -450,27 +470,36 @@ function renderView(view) {
       const value = Math.max(0, Math.min(255, (state.volume[index] - low) * 255 / state.window.width));
       const label = previewLabel(state.mask?.[index] || 0, state.preview && overlay?.[index], targetLabel);
       const color = tumorLabels.has(label) ? tumorRed : (colors[label] || [104, 237, 182]);
-      const alpha = !label || state.hiddenNodules.has(label) ? 0 : tumorLabels.has(label) ? (state.overlay ? 1 : 0) : opacity * (label === state.selectedNodule || label > 255 ? 1 : .65);
+      const showMask = Boolean(label) && !state.hiddenNodules.has(label) && opacity > 0;
       const organ = state.organs ? state.organs[index] : 0;
       const organIsTumor = organ === 65000;
       const showOrgan = state.organVisible && organ && (!state.soloOrgan || organ === state.soloOrgan);
-      const organColor = showOrgan ? (organIsTumor ? tumorRed : state.organColors[organ]) : null;
-      const organAlpha = organColor ? (organIsTumor ? 1 : state.soloOrgan ? .62 : .42) : 0;
+      const segHere = Boolean(showMask && tumorLabels.has(label));
+      const aiHere = Boolean(showOrgan && organIsTumor);
+      let lesionColor = null;
+      if (compare && (segHere || aiHere)) lesionColor = segHere && aiHere ? agreement : segHere ? tumorRed : detectedOnly;
+      else if (aiHere) lesionColor = tumorRed;
+      else if (showMask) lesionColor = color;
       let red = value, green = value, blue = value;
+      const organColor = showOrgan && !organIsTumor ? state.organColors[organ] : null;
+      const organAlpha = organColor ? (state.soloOrgan ? .62 : .42) : 0;
       if (organAlpha) {
         red = value * (1 - organAlpha) + organColor[0] * organAlpha;
         green = value * (1 - organAlpha) + organColor[1] * organAlpha;
         blue = value * (1 - organAlpha) + organColor[2] * organAlpha;
       }
-      if (alpha) {
-        red = red * (1 - alpha) + color[0] * alpha;
-        green = green * (1 - alpha) + color[1] * alpha;
-        blue = blue * (1 - alpha) + color[2] * alpha;
-      }
       pixels.data[p] = red; pixels.data[p + 1] = green; pixels.data[p + 2] = blue;
       pixels.data[p + 3] = 255;
+      if (lesionColor) {
+        const cover = showMask ? opacity : 1;
+        lesionPixels.data[p] = lesionColor[0];
+        lesionPixels.data[p + 1] = lesionColor[1];
+        lesionPixels.data[p + 2] = lesionColor[2];
+        lesionPixels.data[p + 3] = Math.round(cover * 255);
+      }
     }
     bctx.putImageData(pixels, 0, 0);
+    lctx.putImageData(lesionPixels, 0, 0);
     view.rasterKey = rasterKey;
   }
   const sx = state.meta.spacing_xyz[a], sy = state.meta.spacing_xyz[b];
@@ -479,6 +508,7 @@ function renderView(view) {
   const left = (rect.width - dw) / 2 + view.pan[0], top = (rect.height - dh) / 2 + view.pan[1];
   view.transform = {left, top, px: dw / width, py: dh / height, width, height, signX, signY};
   ctx.imageSmoothingEnabled = true; ctx.drawImage(source, left, top, dw, dh);
+  ctx.imageSmoothingEnabled = false; ctx.drawImage(view.lesions, left, top, dw, dh);
   const cx = left + (displayX(state.cross[a]) + .5) * dw / width, cy = top + (displayY(state.cross[b]) + .5) * dh / height;
   ctx.save(); ctx.beginPath(); ctx.rect(left, top, dw, dh); ctx.clip();
   ctx.strokeStyle = "#77bbd57a"; ctx.lineWidth = .7; ctx.beginPath();

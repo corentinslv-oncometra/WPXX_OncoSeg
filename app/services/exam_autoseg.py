@@ -1,7 +1,8 @@
-"""Organ HU and, when no tumor SEG exists, a cancer-specific lesion mask.
+"""Organ HU and a cancer-specific lesion mask for one exam.
 
 TotalSegmentator runs on the CPU in its own environment. A reader can start it
 for the open exam; the validation page never launches it for a whole cohort.
+An existing DICOM SEG tumor stays in place so the automatic lesion can be compared with it.
 """
 
 from __future__ import annotations
@@ -272,42 +273,50 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
                "label": names.get(label_id, f"Label {label_id}").replace("_", " "),
                "color": organ_color(label_id)} for label_id in present]
     tumor_task = None
-    tumor_note = "Fichier SEG déjà utilisé pour la tumeur."
+    tumor_note = ""
     seeded = False
     lesion_mask = None
-    if not source.get("seg_used") and not source.get("tumor_from_seg"):
-        chosen = lesion_task_for_cancer(cancer)
-        if chosen is None:
-            tumor_note = "Aucun modèle ouvert de lésion ne correspond à ce type de cancer."
-        else:
-            tumor_task, needles = chosen
-            report(case_id, state="running", detail="Segmentation des lésions…")
-            lesions_path = stored / "lesions.nii.gz"
-            if not lesions_path.is_file():
-                try:
-                    runner(tumor_task, image_path, lesions_path, fast=False)
-                except Exception as error:
-                    tumor_note = f"Organes prêts. La détection des lésions a échoué : {error}"
-                    lesions_path = None
-            if lesions_path and lesions_path.is_file():
-                lesion_names = class_names(tumor_task)
-                lesion_labels = np.rint(sitk.GetArrayFromImage(on_reference_grid(
-                    image, sitk.ReadImage(str(lesions_path))))).astype(np.uint16)
-                mask = binary_labels(lesion_labels, lesion_names, needles)
-                if int(mask.sum()):
-                    lesion_mask = mask
-                    tumor = sitk.GetImageFromArray(mask.astype(np.uint8))
-                    tumor.CopyInformation(image)
-                    sitk.WriteImage(tumor, str(stored / "tumor.nii.gz"), True)
-                    reference = folder / "reference.nii.gz"
-                    if not reference.exists():
-                        sitk.WriteImage(tumor, str(reference), True)
-                        seeded = _seed_detected_tumor(study_id, reference)
-                    tumor_note = f"Lésions proposées par {tumor_task}."
-                    if not seeded and reference.exists():
-                        tumor_note += " Le brouillon déjà commencé n’a pas été remplacé."
-                else:
-                    tumor_note = f"La tâche {tumor_task} n’a trouvé aucune lésion."
+    seg_kept = bool(source.get("seg_used") or source.get("tumor_from_seg"))
+    chosen = lesion_task_for_cancer(cancer)
+    if chosen is None:
+        tumor_note = "Aucun modèle ouvert de lésion ne correspond à ce type de cancer."
+        if seg_kept:
+            tumor_note += " Le segment SEG est conservé."
+    else:
+        tumor_task, needles = chosen
+        report(case_id, state="running", detail="Segmentation des lésions…")
+        lesions_path = stored / "lesions.nii.gz"
+        if not lesions_path.is_file():
+            try:
+                runner(tumor_task, image_path, lesions_path, fast=False)
+            except Exception as error:
+                tumor_note = f"Organes prêts. La détection des lésions a échoué : {error}"
+                if seg_kept:
+                    tumor_note += " Le segment SEG est conservé."
+                lesions_path = None
+        if lesions_path and lesions_path.is_file():
+            lesion_names = class_names(tumor_task)
+            lesion_labels = np.rint(sitk.GetArrayFromImage(on_reference_grid(
+                image, sitk.ReadImage(str(lesions_path))))).astype(np.uint16)
+            mask = binary_labels(lesion_labels, lesion_names, needles)
+            if int(mask.sum()):
+                lesion_mask = mask
+                tumor = sitk.GetImageFromArray(mask.astype(np.uint8))
+                tumor.CopyInformation(image)
+                sitk.WriteImage(tumor, str(stored / "tumor.nii.gz"), True)
+                reference = folder / "reference.nii.gz"
+                if not reference.exists():
+                    sitk.WriteImage(tumor, str(reference), True)
+                    seeded = _seed_detected_tumor(study_id, reference)
+                tumor_note = f"Lésions proposées par {tumor_task}."
+                if seg_kept:
+                    tumor_note += " Le segment SEG est conservé pour la comparaison."
+                elif not seeded and reference.exists():
+                    tumor_note += " Le brouillon déjà commencé n’a pas été remplacé."
+            else:
+                tumor_note = f"La tâche {tumor_task} n’a trouvé aucune lésion."
+                if seg_kept:
+                    tumor_note += " Le segment SEG est conservé."
     if lesion_mask is not None:
         labels = organ_labels.copy()
         labels[lesion_mask > 0] = np.uint16(65000)
