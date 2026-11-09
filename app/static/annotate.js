@@ -38,7 +38,7 @@ const views = [...document.querySelectorAll(".viewport")].map((node) => ({
   bitmap: document.createElement("canvas"), lesions: document.createElement("canvas"), drag: null,
 }));
 let toastTimer, pollTimer, renderPending = false;
-let pendingPoint = null, pointTimer, pointSave = null;
+let pendingPoint = null, pointTimer, pointSave = null, liveStroke = null;
 const undoQueue = new UndoQueue(() => !state.busy && !state.loading && !pendingPoint && !views.some((v) => v.drag), undo);
 
 async function api(path, options = {}) {
@@ -520,13 +520,24 @@ function renderView(view) {
     ctx.strokeRect(left + (displayX(x0) + .5) * dw / width, top + (displayY(y0) + .5) * dh / height, (x1 - x0) * dw / width * signX, (y1 - y0) * dh / height * signY);
     ctx.setLineDash([]);
   }
-  const strokePreview = view.drag?.points ? view.drag : pendingPoint?.view === view ? pendingPoint.drag : null;
-  if (strokePreview) {
-    ctx.strokeStyle = strokePreview.tool === "erase" ? "#f48776aa" : `rgba(${(state.noduleColors[strokePreview.noduleLabel] || [104, 237, 182]).join(',')},.65)`;
-    ctx.lineWidth = strokePreview.spec.radius_mm * 2 * scale; ctx.lineCap = "round"; ctx.lineJoin = "round";
-    ctx.beginPath(); strokePreview.points.forEach(([u, v], i) => {const fn = i ? "lineTo" : "moveTo"; ctx[fn](left + (displayX(u) + .5) * dw / width, top + (displayY(v) + .5) * dh / height);});
-    if (strokePreview.points.length === 1) {const [u, v] = strokePreview.points[0]; ctx.lineTo(left + (displayX(u) + .5) * dw / width + .01, top + (displayY(v) + .5) * dh / height);}
-    ctx.stroke();
+  const strokePreview = view.drag?.points ? view.drag : liveStroke?.plane === view.plane ? liveStroke : pendingPoint?.view === view ? pendingPoint.drag : null;
+  if (strokePreview?.points && strokePreview.spec) {
+    const spacing = state.meta.spacing_xyz;
+    const distance = (slice - strokePreview.slice) * spacing[normal];
+    const radiusMm = strokePreview.spec.spherical
+      ? sphereSectionRadius(strokePreview.spec.radius_mm, distance)
+      : view.plane === strokePreview.plane && slice === strokePreview.slice ? strokePreview.spec.radius_mm : null;
+    if (radiusMm) {
+      const nodule = (state.meta.nodules || []).find((item) => item.label === strokePreview.noduleLabel);
+      const color = strokePreview.tool === "erase" ? [244, 135, 118] : nodule && isRecordedTumor(nodule) ? tumorRed : (nodule?.color || [104, 237, 182]);
+      ctx.fillStyle = strokePreview.tool === "erase" ? "rgba(244,135,118,.45)" : `rgb(${color.join(",")})`;
+      const radiusPx = radiusMm * scale;
+      for (const [u, v] of strokePreview.points) {
+        ctx.beginPath();
+        ctx.arc(left + (displayX(u) + .5) * dw / width, top + (displayY(v) + .5) * dh / height, radiusPx, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
   }
   if (state.brushHover && isEditTool() && !state.preview && !state.meta.confirmation && !state.busy) {
     const spec = views.find((v) => v.drag?.points)?.drag.spec || strokeSpec(state.tool, state.editSettings);
@@ -689,7 +700,11 @@ for (const view of views) {
         pendingPoint = {view, drag, payload, url: `${base()}/strokes`};
         // Defer point-only edits so a double-click focuses the view without painting a dot.
         pointTimer = setTimeout(task(flushPendingPoint), 600);
-      } else {await pointSave; await mutate(`${base()}/strokes`, payload);}
+      } else {
+        liveStroke = drag;
+        requestRender();
+        try {await pointSave; await mutate(`${base()}/strokes`, payload);} finally {liveStroke = null; requestRender();}
+      }
     }
     if (drag.tool === 'crosshair') {
       const label = state.mask[offset(...state.cross)];
@@ -717,9 +732,14 @@ async function mutate(url, payload, recordUndo = true) {
   if (state.busy || !state.meta) return false;
   state.busy = true; updateControls(); const previous = state.meta.revision_id;
   try {
+    const beforeCount = (state.meta.nodules || []).find((nodule) => nodule.label === payload.nodule_label)?.voxel_count;
     const result = await post(url, {version: state.meta.version, ...payload});
     if (recordUndo) state.undo.push(previous);
     state.preview = false; await reloadDraft();
+    const afterCount = (result.nodules || []).find((nodule) => nodule.label === payload.nodule_label)?.voxel_count;
+    if (payload.points && !payload.erase && beforeCount != null && afterCount === beforeCount) {
+      notify("Ce trait est déjà sur la lésion. Il ne modifie pas le masque.");
+    }
     if (result.protected_other_nodules) notify(`Other nodules were protected. The stroke only changed N${payload.nodule_label}.`);
     return result;
   } catch (error) {
@@ -1084,7 +1104,11 @@ $("test-identity").addEventListener('change', task(async () => {
 window.addEventListener("message", (event) => {
   if (event.origin !== location.origin || event.data?.type !== "oncometra:load-organs") return;
   task(async () => {
-    if (event.data.seeded) await reloadDraft();
+    if (event.data.seeded) {
+      await reloadDraft();
+      const detected = (state.meta?.nodules || []).find((nodule) => nodule.name === "AI lesion detection");
+      if (detected) selectNodule(detected.label);
+    }
     await loadOrgans();
   })();
 });

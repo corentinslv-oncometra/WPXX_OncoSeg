@@ -538,9 +538,15 @@ def test_detection_keeps_seg_and_still_runs_the_lesion_task(clients, monkeypatch
     monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver"} if task == "total" else {1: "lung_nodule"})
     result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
     assert calls == [("total", True), ("lung_nodules", False)]
-    assert result["seeded"] is False
+    assert result["seeded"] is True
+    assert "AI lesion detection" in result["detail"]
     assert "SEG est conservé" in result["detail"]
     assert reference.read_bytes() == before
+    from app.models import AnnotationHead, AnnotationRevision
+    with SessionLocal() as db:
+        head = db.get(AnnotationHead, study)
+        saved = db.get(AnnotationRevision, head.revision_id)
+    assert [item["name"] for item in saved.details["nodules"]] == ["AI lesion detection"]
     legend = admin.get(f"/api/studies/{study}/organ-overlay").json()["legend"]
     assert legend[-1]["id"] == 65000
     with SessionLocal() as db:

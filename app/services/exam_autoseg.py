@@ -304,14 +304,16 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
                 tumor = sitk.GetImageFromArray(mask.astype(np.uint8))
                 tumor.CopyInformation(image)
                 sitk.WriteImage(tumor, str(stored / "tumor.nii.gz"), True)
-                reference = folder / "reference.nii.gz"
-                if not reference.exists():
-                    sitk.WriteImage(tumor, str(reference), True)
-                    seeded = _seed_detected_tumor(study_id, reference)
+                outcome = _record_ai_lesion(study_id, mask)
+                seeded = outcome == "added"
                 tumor_note = f"Lésions proposées par {tumor_task}."
+                if seeded:
+                    tumor_note += " La lésion « AI lesion detection » a été ajoutée."
+                elif outcome == "covered":
+                    tumor_note += " Elle est déjà couverte par une lésion enregistrée."
                 if seg_kept:
                     tumor_note += " Le segment SEG est conservé pour la comparaison."
-                elif not seeded and reference.exists():
+                elif not seeded and (folder / "reference.nii.gz").exists():
                     tumor_note += " Le brouillon déjà commencé n’a pas été remplacé."
             else:
                 tumor_note = f"La tâche {tumor_task} n’a trouvé aucune lésion."
@@ -337,27 +339,62 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
     return {"detail": detail, "seeded": seeded}
 
 
-def _seed_detected_tumor(study_id: str, reference: Path) -> bool:
+AI_LESION_NAME = "AI lesion detection"
+
+
+def _record_ai_lesion(study_id: str, lesion_mask) -> str:
+    """Add the detected lesion to the annotation list without replacing another lesion."""
+    from fastapi import HTTPException
     from app.db import SessionLocal
-    from app.oncometra import _seed_tumor_overlay
-    from app.oncometra_models import WorkspaceUser
+    from app.lung_api import current_mask, image_for, nodules_for, save_revision, check_editable
     from app.models import AnnotationHead
+    from app.oncometra import user_payload
+    from app.oncometra_models import WorkspaceAssignment, WorkspaceUser
+    from app.services.nodules import MAX_NODULE_LABEL, new_nodule
 
     with SessionLocal() as db:
         head = db.get(AnnotationHead, study_id)
-        if head is None or head.revision_id or not reference.is_file():
-            return False
-        from app.oncometra_models import WorkspaceAssignment
         assignment = db.get(WorkspaceAssignment, study_id)
-        if assignment is None:
-            return False
-        user = db.get(WorkspaceUser, assignment.user_id)
-        if user is None:
-            return False
-        _seed_tumor_overlay(db, study_id, reference, user)
-        db.commit()
-        head = db.get(AnnotationHead, study_id)
-        return bool(head and head.revision_id)
+        user = db.get(WorkspaceUser, assignment.user_id) if assignment else None
+        if head is None or user is None:
+            return "skipped"
+        try:
+            check_editable(db, head)
+            image = image_for(str(study_id))
+        except HTTPException:
+            return "skipped"
+        mask = current_mask(head, image)
+        detected = np.asarray(lesion_mask) > 0
+        if mask.shape != detected.shape or not int(detected.sum()):
+            return "skipped"
+        if head.revision_id:
+            nodules = nodules_for(db, head)
+            existing = next((item for item in nodules if item.get("name") == AI_LESION_NAME), None)
+            if existing:
+                label = int(existing["label"])
+                mask[mask == label] = 0
+            else:
+                label = max(int(item["label"]) for item in nodules) + 1
+                if label > MAX_NODULE_LABEL:
+                    return "skipped"
+                nodule = new_nodule(label)
+                nodule["name"] = AI_LESION_NAME
+                nodule["color"] = [0, 188, 255]
+                nodules = [*nodules, nodule]
+        else:
+            label = 1
+            nodule = new_nodule(label)
+            nodule["name"] = AI_LESION_NAME
+            nodule["color"] = [0, 188, 255]
+            nodules = [nodule]
+        painted = detected & ((mask == 0) | (mask == label))
+        if not int(painted.sum()):
+            return "covered"
+        mask[painted] = np.uint8(label)
+        db.info["annotation_actor"] = user_payload(user)
+        save_revision(db, head, image, mask, "ai-lesion",
+                      {"source": AI_LESION_NAME, "nodule_label": label}, nodules, changed_nodule=label)
+        return "added"
 
 
 def organ_overlay(case_dir: Path) -> dict | None:
