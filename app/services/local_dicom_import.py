@@ -103,6 +103,53 @@ def _neighbor(patients, patient_index, time_index, step):
     return {"patient_id": patients[target]["id"], "timepoint_id": timepoints[chosen]["id"]}
 
 
+def _mark_seg_present(relative: str, patient: dict) -> None:
+    from app.services.dicom_seg import study_has_seg
+
+    root = resolve_data_dir(relative)
+    studies: dict[Path, bool] = {}
+    for timepoint in patient["timepoints"]:
+        if "seg_present" in timepoint:
+            continue
+        study = (root / timepoint["id"]).resolve().parent
+        if study not in studies:
+            studies[study] = study_has_seg(study / "_")
+        timepoint["seg_present"] = studies[study]
+
+
+def _used_timepoints(project_id: str, relative: str) -> dict[str, bool]:
+    from app.db import SessionLocal
+    from app.oncometra_models import WorkspaceCase
+    from sqlalchemy import select
+
+    text = relative.strip().replace("\\", "/").lstrip("/")
+    found: dict[str, bool] = {}
+    with SessionLocal() as db:
+        cases = db.scalars(select(WorkspaceCase).where(WorkspaceCase.project_id == project_id))
+        for case in cases:
+            source = case.source or {}
+            if source.get("local_path") != text:
+                continue
+            timepoint = source.get("local_timepoint")
+            if timepoint:
+                found[str(timepoint)] = bool(source.get("seg_used") or source.get("tumor_from_seg"))
+    return found
+
+
+def patient_navigation(project_id: str, relative: str, patient_id: str) -> list[dict]:
+    """Timepoints for one patient, with whether a SEG file exists and was used."""
+    catalog = scan_catalog(relative)
+    patient = next((item for item in catalog["patients"] if item["id"] == patient_id), None)
+    if patient is None:
+        raise ValueError("Ce patient est introuvable dans le dossier.")
+    _mark_seg_present(relative, patient)
+    used = _used_timepoints(project_id, catalog["path"])
+    return [{
+        "id": item["id"], "label": item["label"], "slices": item["slices"],
+        "seg_present": bool(item.get("seg_present")), "seg_used": used.get(item["id"], False),
+    } for item in patient["timepoints"]]
+
+
 def catalog_position(relative: str, patient_id: str, timepoint_id: str) -> dict:
     catalog = scan_catalog(relative)
     patients = catalog["patients"]

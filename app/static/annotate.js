@@ -189,6 +189,9 @@ async function openCase(id) {
 
 async function loadOrgans() {
   if (!state.id || !state.volume) return;
+  state.aiDetected = false;
+  state.lesionDice = null;
+  renderLesionDice();
   let info;
   try { info = await json(`/api/studies/${state.id}/organ-overlay`); }
   catch (error) { if (error.status === 404) return; throw error; }
@@ -198,6 +201,8 @@ async function loadOrgans() {
   state.organs = labels;
   state.organColors = Object.fromEntries(info.legend.map((item) => [item.id, item.color]));
   state.organNames = Object.fromEntries(info.legend.map((item) => [item.id, item.label]));
+  state.aiDetected = Boolean(info.ai_detected);
+  state.lesionDice = typeof info.dice === "number" ? info.dice : null;
   state.soloOrgan = null;
   state.displayVersion++;
   const chip = $("organ-hold");
@@ -205,7 +210,61 @@ async function loadOrgans() {
   if (state.tool === "crosshair") setTool("crosshair");
   updateTumorMarks();
   updateCompareHint();
+  updateOrganBox();
+  renderLesionDice();
   requestRender();
+}
+function renderLesionDice() {
+  const node = $("lesion-dice");
+  if (!node) return;
+  if (!state.aiDetected) { node.hidden = true; node.textContent = ""; return; }
+  node.hidden = false;
+  node.textContent = typeof state.lesionDice === "number"
+    ? `Score Dice ${state.lesionDice.toLocaleString("fr-FR", {minimumFractionDigits: 2, maximumFractionDigits: 2})}`
+    : "Score Dice non calculé : aucun segment SEG.";
+}
+const ORGAN_BOX_GREEN = "#39FF14";
+function lesionLabels() {
+  const labels = new Set();
+  for (const nodule of state.meta?.nodules || []) {
+    const name = (nodule.name || "").toLowerCase();
+    if (isRecordedTumor(nodule) || name.includes("lesion") || name.includes("tumeur") || name.includes("tumor")) labels.add(nodule.label);
+  }
+  return labels;
+}
+function updateOrganBox() {
+  state.organBox = null;
+  if (!state.organs || !state.meta) return;
+  const [xSize, ySize, zSize] = state.meta.size_xyz;
+  const organs = state.organs;
+  const mask = state.mask;
+  const lesions = lesionLabels();
+  const votes = new Map();
+  const neighbors = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  let seen = 0;
+  for (let z = 0; z < zSize; z++) {
+    for (let y = 0; y < ySize; y++) {
+      const row = (z * ySize + y) * xSize;
+      for (let x = 0; x < xSize; x++) {
+        const index = row + x;
+        if (!(organs[index] === 65000 || (mask && lesions.has(mask[index])))) continue;
+        if ((seen++ % 4) !== 0) continue;
+        const here = organs[index];
+        if (here && here !== 65000) votes.set(here, (votes.get(here) || 0) + 4);
+        for (const [dx, dy, dz] of neighbors) {
+          const nx = x + dx, ny = y + dy, nz = z + dz;
+          if (nx < 0 || ny < 0 || nz < 0 || nx >= xSize || ny >= ySize || nz >= zSize) continue;
+          const organ = organs[offset(nx, ny, nz)];
+          if (!organ || organ === 65000) continue;
+          votes.set(organ, (votes.get(organ) || 0) + 1);
+        }
+      }
+    }
+  }
+  if (!votes.size) return;
+  let organ = 0, best = 0;
+  for (const [label, count] of votes) if (count > best) { organ = label; best = count; }
+  state.organBox = {label: organ, name: state.organNames?.[organ] || "Organe"};
 }
 function isRecordedTumor(nodule) {
   const name = (nodule.name || "").toLowerCase();
@@ -294,6 +353,7 @@ async function loadMask() {
   state.mask = mask;
   updateTumorMarks();
   updateCompareHint();
+  updateOrganBox();
 }
 async function reloadDraft() {
   state.meta = await json(base());
@@ -453,9 +513,10 @@ function renderView(view) {
   }
   const opacity = state.overlay ? Number(opacityControl.value) : 0;
   const low = state.window.level - state.window.width / 2;
+  const outlineOrgan = state.organBox?.label || 0;
   const rasterKey = [state.volume, state.mask, overlay, opacity, low, state.window.width, slice,
     state.preview, targetLabel, state.selectedNodule, state.displayVersion, signX, signY,
-    state.organs, state.soloOrgan, state.organVisible, compare];
+    state.organs, state.soloOrgan, state.organVisible, compare, outlineOrgan];
   // Zoom, pan and crosshair changes reuse the raster instead of windowing every voxel again.
   if (!view.rasterKey || rasterKey.some((value, i) => value !== view.rasterKey[i])) {
     source.width = width; source.height = height;
@@ -463,6 +524,8 @@ function renderView(view) {
     lesions.width = width; lesions.height = height;
     const bctx = source.getContext("2d"); const pixels = bctx.createImageData(width, height);
     const lctx = lesions.getContext("2d"); const lesionPixels = lctx.createImageData(width, height);
+    const outline = [];
+    const volumeSize = state.meta.size_xyz;
     for (let v = 0; v < height; v++) for (let u = 0; u < width; u++) {
       let x, y, z; const nativeU = displayX(u), nativeV = displayY(v);
       if (normal === 2) {x = nativeU; y = nativeV; z = slice;} else if (normal === 1) {x = nativeU; y = slice; z = nativeV;} else {x = slice; y = nativeU; z = nativeV;}
@@ -497,9 +560,22 @@ function renderView(view) {
         lesionPixels.data[p + 2] = lesionColor[2];
         lesionPixels.data[p + 3] = Math.round(cover * 255);
       }
+      if (outlineOrgan && organ === outlineOrgan) {
+        let edge = false;
+        for (const [da, db] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          let nx = x, ny = y, nz = z;
+          if (a === 0) nx += da; else if (a === 1) ny += da; else nz += da;
+          if (b === 0) nx += db; else if (b === 1) ny += db; else nz += db;
+          const outside = nx < 0 || ny < 0 || nz < 0 || nx >= volumeSize[0] || ny >= volumeSize[1] || nz >= volumeSize[2];
+          const neighbor = outside ? 0 : state.organs[offset(nx, ny, nz)];
+          if (outside || (neighbor !== outlineOrgan && neighbor !== 65000)) { edge = true; break; }
+        }
+        if (edge) outline.push(u, v);
+      }
     }
     bctx.putImageData(pixels, 0, 0);
     lctx.putImageData(lesionPixels, 0, 0);
+    view.organOutline = outline;
     view.rasterKey = rasterKey;
   }
   const sx = state.meta.spacing_xyz[a], sy = state.meta.spacing_xyz[b];
@@ -511,6 +587,31 @@ function renderView(view) {
   ctx.imageSmoothingEnabled = false; ctx.drawImage(view.lesions, left, top, dw, dh);
   const cx = left + (displayX(state.cross[a]) + .5) * dw / width, cy = top + (displayY(state.cross[b]) + .5) * dh / height;
   ctx.save(); ctx.beginPath(); ctx.rect(left, top, dw, dh); ctx.clip();
+  const outline = view.organOutline;
+  const predictionVisible = state.organVisible || state.overlay;
+  if (outline?.length && state.organBox && predictionVisible) {
+    const px = dw / width, py = dh / height;
+    const radius = Math.max(px, py) * (view.plane === "axial" ? 2.4 : 0.85);
+    ctx.save();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = ORGAN_BOX_GREEN;
+    ctx.beginPath();
+    let labelU = outline[0], labelV = outline[1];
+    for (let i = 0; i < outline.length; i += 2) {
+      const u = outline[i], v = outline[i + 1];
+      const x = left + (u + .5) * px, y = top + (v + .5) * py;
+      ctx.moveTo(x + radius, y);
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      if (v < labelV) { labelU = u; labelV = v; }
+    }
+    ctx.fill();
+    ctx.font = "700 12px sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(state.organBox.name, left + (labelU + .5) * px + radius + 4, top + (labelV + .5) * py);
+    ctx.restore();
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(view.lesions, left, top, dw, dh);
+  }
   ctx.strokeStyle = "#77bbd57a"; ctx.lineWidth = .7; ctx.beginPath();
   ctx.moveTo(cx, top); ctx.lineTo(cx, cy - 9); ctx.moveTo(cx, cy + 9); ctx.lineTo(cx, top + dh);
   ctx.moveTo(left, cy); ctx.lineTo(cx - 9, cy); ctx.moveTo(cx + 9, cy); ctx.lineTo(left + dw, cy); ctx.stroke();

@@ -428,6 +428,45 @@ def test_local_catalog_opens_one_timepoint(clients):
     assert again.json()["study_id"] == body["study_id"]
 
 
+def _write_seg_header(directory: Path):
+    import pydicom
+    from pydicom.dataset import FileDataset, FileMetaDataset
+    directory.mkdir(parents=True, exist_ok=True)
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.66.4"
+    file_meta.MediaStorageSOPInstanceUID = "1.2.3.4.9.1"
+    file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+    dataset = FileDataset(str(directory / "seg.dcm"), {}, file_meta=file_meta, preamble=b"\0" * 128)
+    dataset.Modality = "SEG"
+    dataset.SOPClassUID = file_meta.MediaStorageSOPClassUID
+    dataset.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+    dataset.is_little_endian = True
+    dataset.is_implicit_VR = False
+    dataset.save_as(directory / "seg.dcm")
+
+
+def test_patient_list_reports_whether_the_seg_is_present_and_used(clients):
+    admin, _, _ = clients
+    root = Path(os.environ["APP_STORAGE_ROOT"]) / "nav-set"
+    _write_ct_series(root / "PAT1" / "2016-01-02-NA-aaa-11111" / "2-Portal-aaaa1", "P1", "1.2.3.4.8.1")
+    _write_seg_header(root / "PAT1" / "2016-01-02-NA-aaa-11111" / "300-SEG-cccc3")
+    _write_ct_series(root / "PAT1" / "2016-06-01-NA-bbb-22222" / "3-Follow-bbbb2", "P1", "1.2.3.4.8.2")
+    listed = admin.get("/api/projects/lung-ct/local-catalog/patient", params={"path": "nav-set", "patient_id": "PAT1"})
+    assert listed.status_code == 200, listed.text
+    rows = listed.json()
+    assert rows[0]["seg_present"] is True and rows[0]["seg_used"] is False
+    assert rows[1]["seg_present"] is False and rows[1]["seg_used"] is False
+    with SessionLocal() as db:
+        db.add(WorkspaceCase(
+            id=str(uuid4()), project_id="lung-ct", patient_id="PAT1 · portal", modality="CT",
+            source={"local_path": "nav-set", "local_timepoint": rows[0]["id"], "seg_present": True, "seg_used": True, "tumor_from_seg": True},
+        ))
+        db.commit()
+    again = admin.get("/api/projects/lung-ct/local-catalog/patient", params={"path": "nav-set", "patient_id": "PAT1"})
+    assert again.json()[0]["seg_used"] is True
+    assert admin.get("/api/projects/lung-ct/local-catalog/patient", params={"path": "nav-set", "patient_id": "ABSENT"}).status_code == 422
+
+
 def test_local_folder_import_reads_dicom_inside_data(clients):
     admin, _, _ = clients
     root = Path(os.environ["APP_STORAGE_ROOT"])
@@ -547,9 +586,89 @@ def test_detection_keeps_seg_and_still_runs_the_lesion_task(clients, monkeypatch
         head = db.get(AnnotationHead, study)
         saved = db.get(AnnotationRevision, head.revision_id)
     assert [item["name"] for item in saved.details["nodules"]] == ["AI lesion detection"]
-    legend = admin.get(f"/api/studies/{study}/organ-overlay").json()["legend"]
-    assert legend[-1]["id"] == 65000
+    legend = admin.get(f"/api/studies/{study}/organ-overlay").json()
+    assert legend["legend"][-1]["id"] == 65000
+    assert isinstance(legend["dice"], float)
+    assert 0 <= legend["dice"] <= 1
     with SessionLocal() as db:
         source = db.get(WorkspaceCase, case.id).source
     assert source["tumor_from_seg"] is True
     assert source.get("tumor_from_model") is not True
+    assert result["dice"] is not None
+    assert 0 <= result["dice"] <= 1
+    assert "Score Dice" in result["detail"]
+
+
+def test_kaggle_device_fetches_both_masks_and_skips_the_local_binary(clients, monkeypatch):
+    from app.services import exam_autoseg
+    admin, _, _ = clients
+    case = fixture_case()
+    study = assigned(admin, case)
+    monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "kaggle")
+    seen = []
+
+    def remote(image_path, uid, lesion_task, dest, report=None):
+        seen.append(lesion_task)
+        image = sitk.ReadImage(str(image_path))
+        labels = np.zeros(tuple(reversed(image.GetSize())), np.uint16)
+        labels[0, 0, :16] = 1
+        labels[0, 1, :16] = 2
+        painted = sitk.GetImageFromArray(labels)
+        painted.CopyInformation(image)
+        sitk.WriteImage(painted, str(dest / "organs.nii.gz"), True)
+        sitk.WriteImage(painted, str(dest / "lesions.nii.gz"), True)
+
+    def runner(*_args, **_kwargs):
+        raise AssertionError("local TotalSegmentator")
+
+    monkeypatch.setattr("app.services.kaggle_autoseg.ensure_remote_masks", remote)
+    monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver", 2: "spleen"} if task == "total" else {1: "lung_nodule"})
+    result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
+    assert seen == ["lung_nodules"]
+    assert "Lésions proposées par lung_nodules" in result["detail"]
+    assert "AI lesion detection" in result["detail"]
+
+
+def test_ai_segmentation_is_reserved_for_an_administrator(clients, monkeypatch):
+    admin, reader, _reviewer = clients
+    seen = {}
+
+    def fake(project_id, user_id):
+        seen["project"] = project_id
+        seen["user"] = user_id
+        return {"state": "running", "detail": "Lecture des examens…", "error": "", "total": 0, "done": 0, "skipped": 0, "failed": 0, "current": []}
+
+    monkeypatch.setattr("app.services.cohort_autoseg.start_cohort", fake)
+    assert reader.post("/api/projects/liver-ct/ai-segmentation").status_code == 403
+    started = admin.post("/api/projects/liver-ct/ai-segmentation")
+    assert started.status_code == 202
+    assert started.json()["state"] == "running"
+    assert seen["project"] == "liver-ct"
+    assert admin.get("/api/projects/liver-ct/ai-segmentation").status_code == 200
+
+
+def test_dice_score_measures_overlap_with_the_reference_segment():
+    from app.services.exam_autoseg import dice_score
+    predicted = np.zeros((2, 2), dtype=bool)
+    reference = np.zeros((2, 2), dtype=bool)
+    predicted[0, :] = True
+    reference[:, 0] = True
+    assert dice_score(predicted, reference) == 0.5
+    assert dice_score(predicted, np.zeros((3, 3), dtype=bool)) is None
+    assert dice_score(np.zeros((2, 2), dtype=bool), np.zeros((2, 2), dtype=bool)) is None
+    from app.services import exam_autoseg
+    assert exam_autoseg.output_percent("\x1b[32m 42%|██ | 8/20") == 42
+    assert exam_autoseg.output_percent("rien") is None
+    assert exam_autoseg.span_percent(4, 46, 50) == 25
+    assert exam_autoseg.remote_percent("GPU Kaggle : RUNNING") == 62
+    case_id = "progress-case"
+    exam_autoseg._status.pop(case_id, None)
+    started = time.time() - 30
+    exam_autoseg._set_status(case_id, state="running", detail="Segmentation des organes…", percent=10, started_at=started, error="", seeded=False)
+    exam_autoseg._set_status(case_id, state="running", percent=4, detail="plus tard")
+    assert exam_autoseg.detection_status(case_id)["percent"] == 10
+    exam_autoseg._set_status(case_id, state="done", detail="fini", seeded=False)
+    exam_autoseg._status[case_id]["finished_at"] = started + 12
+    assert exam_autoseg.detection_status(case_id)["elapsed_s"] == 12
+    assert exam_autoseg.detection_status(case_id)["percent"] == 100
+    exam_autoseg._status.pop(case_id, None)

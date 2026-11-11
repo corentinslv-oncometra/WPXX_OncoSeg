@@ -4,7 +4,7 @@ const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp
 const roleName = value => ({admin:'Administrateur', reviewer:'Radiologue', junior_annotator:'Annotateur', senior_annotator:'Annotateur senior'}[value] || value);
 const statusName = value => ({new:'À annoter', in_progress:'Annotation en cours', completed:'À valider', approved:'Validé', queued:'En attente', running:'En cours', succeeded:'Extrait', failed:'Échec'}[value] || value);
 const badge = value => `<span class="status ${escape(value)}">${escape(statusName(value))}</span>`;
-const state = {user:null, data:null, tab:'datasets', project:'', query:'', status:'', assignment:null, jobs:[], users:[], browse:null};
+const state = {user:null, data:null, tab:'datasets', project:'', query:'', status:'', assignment:null, jobs:[], users:[], browse:null, ai:{}, aiTimer:0};
 let toastTimer;
 async function api(path, data, method) {
   const options = {method:method || (data ? 'POST':'GET'), credentials:'same-origin', headers:{}};
@@ -29,7 +29,7 @@ function pendingCount(){
   return state.data.cases.filter(item=>ids.has(item.project_id) && !state.data.assignments.some(row=>row.case_id===item.id && row.status==='approved')).length;
 }
 async function refresh(render=true){state.data=await api('/api/workspace');$('work-count').textContent=pendingCount();$('storage-status').textContent=state.data.storage==='ephemeral'?'Stockage temporaire':'Stockage local';if(render && state.tab!=='annotation') await showTab(state.tab);}
-async function showTab(tab){state.tab=tab;const selected=tab==='annotation'?'review':tab;document.querySelectorAll('[data-tab]').forEach(button=>button.classList.toggle('selected',button.dataset.tab===selected));$('annotation-page').hidden=tab!=='annotation';$('content').hidden=tab==='annotation';if(tab==='annotation')return;const renders={datasets:platform.renderDatasets,cohorts:renderCohorts,review:renderReview,admin:renderAdmin};await renders[tab]();}
+async function showTab(tab){state.tab=tab;const selected=tab==='annotation'?'review':tab;document.querySelectorAll('[data-tab]').forEach(button=>button.classList.toggle('selected',button.dataset.tab===selected));$('annotation-page').hidden=tab!=='annotation';$('content').hidden=tab==='annotation';if(tab!=='annotation') hideDetection();if(tab==='annotation')return;const renders={datasets:platform.renderDatasets,cohorts:renderCohorts,review:renderReview,admin:renderAdmin};await renders[tab]();}
 
 function cohortStatus(project){
   if(!project.cases) return {id:'failed', label:'Images non importées'};
@@ -44,14 +44,55 @@ function cohortGaps(project){
   if(project.dataset.segmentations!==true && !project.approved) gaps.push('pas de masque');
   return gaps;
 }
-function renderCohorts(){
+function aiLine(status){
+  if(!status || status.state==='idle') return '';
+  if(status.state==='running') return `${status.done}/${status.total || '…'} · ${status.detail || 'Segmentation en cours'}`;
+  return status.error || status.detail || '';
+}
+async function loadAiStatus(){
+  if(state.user?.role!=='admin') return;
+  const projects=cohortProjects().filter(project=>project.modality==='CT');
+  await Promise.all(projects.map(async project=>{
+    try{state.ai[project.id]=await api(`/api/projects/${project.id}/ai-segmentation`);}
+    catch(_error){/* The row stays usable if the status call fails. */}
+  }));
+}
+function watchAi(){
+  clearInterval(state.aiTimer);
+  const running=Object.entries(state.ai).filter(([,status])=>status?.state==='running');
+  if(!running.length) return;
+  state.aiTimer=setInterval(action(async()=>{
+    if(state.tab!=='cohorts'){clearInterval(state.aiTimer);return;}
+    let finished=false;
+    for(const [id, previous] of running){
+      if(previous.state!=='running') continue;
+      const status=await api(`/api/projects/${id}/ai-segmentation`);
+      state.ai[id]=status;
+      const node=document.querySelector(`[data-ai-status="${CSS.escape(id)}"]`);
+      if(node){node.hidden=!aiLine(status);node.textContent=aiLine(status);}
+      const button=document.querySelector(`[data-ai-project="${CSS.escape(id)}"]`);
+      if(button) button.disabled=status.state==='running';
+      if(status.state!=='running') finished=true;
+    }
+    if(!Object.values(state.ai).some(status=>status?.state==='running')) clearInterval(state.aiTimer);
+    if(finished){await refresh(false);if(state.tab==='cohorts')await renderCohorts();}
+  }), 4000);
+}
+async function renderCohorts(){
+  await loadAiStatus();
   const cohorts=cohortProjects();
   const rows=cohorts.map(project=>{
     const status=cohortStatus(project);
     const gaps=cohortGaps(project);
-    return `<tr><td><strong>${escape(project.name)}</strong><small>${escape(project.dataset.name)} · ${project.modality==='MR'?'IRM':'CT'}</small>${gaps.length?`<small>Encore : ${escape(gaps.join(', '))}</small>`:''}</td><td><span class="status ${status.id}">${escape(status.label)}</span></td><td>${project.cases}</td><td>${project.approved}</td><td><div class="row-actions"><button type="button" disabled title="Le calcul part avant la page À valider, un examen à la fois. Il ne se lance pas depuis cette liste.">Lancer la segmentation</button><button class="primary" data-browse-project="${project.id}">Choisir un patient</button><button data-import-project="${project.id}">Importer des fichiers</button>${project.cases?`<button data-project="${project.id}">Voir les examens</button>`:''}</div><small>Préparée avant la validation</small></td></tr>`;
+    const ai=state.ai[project.id];
+    const running=ai?.state==='running';
+    const aiButton=state.user.role==='admin' && project.modality==='CT'
+      ? `<button class="primary" data-ai-project="${escape(project.id)}" ${running?'disabled':''}>AI segmentation</button><small data-ai-status="${escape(project.id)}" ${aiLine(ai)?'':'hidden'}>${escape(aiLine(ai))}</small>`
+      : '';
+    return `<tr><td><strong>${escape(project.name)}</strong><small>${escape(project.dataset.name)} · ${project.modality==='MR'?'IRM':'CT'}</small>${gaps.length?`<small>Encore : ${escape(gaps.join(', '))}</small>`:''}</td><td><span class="status ${status.id}">${escape(status.label)}</span></td><td>${project.cases}</td><td>${project.approved}</td><td><div class="row-actions">${aiButton}<button data-browse-project="${project.id}">Choisir un patient</button><button data-import-project="${project.id}">Importer des fichiers</button>${project.cases?`<button data-project="${project.id}">Voir les examens</button>`:''}</div></td></tr>`;
   }).join('');
-  $('content').innerHTML=heading('Cohortes','Les datasets que vous avez choisis.')+`<section class="table-panel">${cohorts.length?`<div class="table-scroll"><table><thead><tr><th>Cohorte</th><th>État</th><th>Images</th><th>Validés</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="empty"><h2>Aucune cohorte</h2><p>'+(state.user.role==='admin'?'Choisissez un dataset exploitable.':'Aucune cohorte n’est encore ouverte.')+'</p></div>'}</section><p class="small-note">TotalSegmentator calcule les organes et les lésions sur l’examen ouvert. Un fichier SEG déjà présent est conservé pour la comparaison. Un seul examen est préparé sur ce poste, sans GPU.</p>`;
+  $('content').innerHTML=heading('Cohortes','Les datasets que vous avez choisis.')+`<section class="table-panel">${cohorts.length?`<div class="table-scroll"><table><thead><tr><th>Cohorte</th><th>État</th><th>Images</th><th>Validés</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="empty"><h2>Aucune cohorte</h2><p>'+(state.user.role==='admin'?'Choisissez un dataset exploitable.':'Aucune cohorte n’est encore ouverte.')+'</p></div>'}</section><p class="small-note">AI segmentation envoie tous les examens CT de la cohorte sur un GPU Kaggle, un examen à la fois. Le segment SEG déjà présent est conservé pour la comparaison. Les masques déjà calculés ne sont pas relancés.</p>`;
+  watchAi();
 }
 
 function filters(){return `<div class="filters"><input id="filter-query" aria-label="Chercher un examen" placeholder="Chercher un examen" value="${escape(state.query)}"><select id="filter-project" aria-label="Cohorte">${projectOptions()}</select><select id="filter-status" aria-label="État"><option value="">Tous les états</option>${['new','in_progress','completed','approved'].map(s=>`<option value="${s}" ${state.status===s?'selected':''}>${statusName(s)}</option>`).join('')}</select></div>`;}
@@ -106,6 +147,25 @@ function browsePosition(patientId, timepointId){
     next_timepoint:timeIndex+1<timepoints.length?{patient_id:patientId, timepoint_id:timepoints[timeIndex+1].id}:null,
     previous_patient:neighbor(-1), next_patient:neighbor(1)};
 }
+function segMark(timepoint){
+  if(timepoint.seg_used) return {text:'SEG présent · utilisé', cls:'used'};
+  if(timepoint.seg_present) return {text:'SEG présent · non utilisé', cls:'unused'};
+  if(timepoint.seg_present===false) return {text:'SEG absent', cls:'absent'};
+  return {text:'SEG…', cls:'absent'};
+}
+async function loadPatientSeg(patientId){
+  const browse=state.browse;
+  const patient=browse?.catalog?.patients.find(item=>item.id===patientId);
+  if(!patient) return;
+  const rows=await api(`/api/projects/${browse.projectId}/local-catalog/patient?path=${encodeURIComponent(browse.path)}&patient_id=${encodeURIComponent(patientId)}`);
+  const byId=Object.fromEntries(rows.map(item=>[item.id, item]));
+  for(const timepoint of patient.timepoints){
+    const row=byId[timepoint.id];
+    if(!row) continue;
+    timepoint.seg_present=!!row.seg_present;
+    timepoint.seg_used=!!row.seg_used;
+  }
+}
 function renderBrowseNav(){
   const nav=$('browse-nav');
   const position=state.browse&&browsePosition(state.browse.patientId, state.browse.timepointId);
@@ -113,11 +173,24 @@ function renderBrowseNav(){
   if(!position){nav.hidden=true;return;}
   Object.assign(state.browse, position);
   nav.hidden=false;
-  $('browse-position').innerHTML=`<strong>${escape(position.patient_id)}</strong><span>${escape(position.label)}</span><span>Patient ${position.patient_index + 1} / ${position.patient_count} · Temps ${position.timepoint_index + 1} / ${position.timepoint_count}</span>`;
-  $('browse-prev-patient').disabled=!position.previous_patient;
-  $('browse-next-patient').disabled=!position.next_patient;
-  $('browse-prev-time').disabled=!position.previous_timepoint;
-  $('browse-next-time').disabled=!position.next_timepoint;
+  const menu=$('browse-menu');
+  const panel=$('browse-panel');
+  menu.textContent=position.patient_id;
+  menu.title=`Patient ${position.patient_index + 1} / ${position.patient_count}`;
+  menu.setAttribute('aria-expanded', state.browse.panelOpen?'true':'false');
+  panel.hidden=!state.browse.panelOpen;
+  if(!state.browse.panelOpen){panel.replaceChildren();return;}
+  const patients=state.browse.catalog.patients;
+  const expanded=state.browse.expandedPatient||'';
+  panel.innerHTML=patients.map(patient=>{
+    const open=patient.id===expanded;
+    const times=open?`<div class="browse-times">${patient.timepoints.map(timepoint=>{
+      const mark=segMark(timepoint);
+      const current=patient.id===state.browse.patientId&&timepoint.id===state.browse.timepointId;
+      return `<button type="button" class="browse-time${current?' current':''}" data-browse-time="${escape(timepoint.id)}" data-browse-owner="${escape(patient.id)}"><span class="browse-time-label">${escape(timepoint.label)}</span><span class="seg-state ${mark.cls}">${escape(mark.text)}</span></button>`;
+    }).join('')}</div>`:'';
+    return `<button type="button" class="browse-patient${patient.id===state.browse.patientId?' current':''}${open?' expanded':''}" data-browse-patient="${escape(patient.id)}" aria-expanded="${open?'true':'false'}">${escape(patient.id)}<span>${open?'▾':'▸'}</span></button>${times}`;
+  }).join('');
 }
 function renderPatientPicker(){
   const host=$('local-status');
@@ -143,7 +216,7 @@ async function loadPatientPicker(form){
   renderPatientPicker();
 }
 function browseDataset(projectId){
-  showModal('Choisir un examen',`<form id="import-form"><p class="small-note">Un seul patient et un seul temps sont chargés. Vous pourrez passer au temps ou au patient suivant dans la visionneuse.</p><label class="form-label">Dossier déjà dans data<input id="local-path" value="TCIA_Data/hcc_tace_seg" spellcheck="false"></label><input type="hidden" name="project_id" value="${escape(projectId)}"><label class="form-label"><span><input name="deidentified" type="checkbox" required> Ces images sont dé-identifiées et autorisées pour cette cohorte.</span></label><div id="local-status" class="small-note"></div><button class="primary">Afficher les patients</button></form>`);
+  showModal('Choisir un examen',`<form id="import-form"><p class="small-note">Un seul patient et un seul temps sont chargés. La liste Patients dans la visionneuse ouvre les autres temps.</p><label class="form-label">Dossier déjà dans data<input id="local-path" value="TCIA_Data/hcc_tace_seg" spellcheck="false"></label><input type="hidden" name="project_id" value="${escape(projectId)}"><label class="form-label"><span><input name="deidentified" type="checkbox" required> Ces images sont dé-identifiées et autorisées pour cette cohorte.</span></label><div id="local-status" class="small-note"></div><button class="primary">Afficher les patients</button></form>`);
   $('import-form').onsubmit=action(async event=>{event.preventDefault();await loadPatientPicker(event.target);});
 }
 async function openBrowsed(target){
@@ -151,7 +224,7 @@ async function openBrowsed(target){
   if(!browse) throw new Error('Choisissez d’abord un patient.');
   const patientId=target?.patient_id||$('browse-patient')?.value||browse.patientId;
   const timepointId=target?.timepoint_id||$('browse-time')?.value||browse.timepointId;
-  if($('browse-position')) $('browse-position').textContent='Ouverture du volume…';
+  if($('browse-menu')) $('browse-menu').textContent='Ouverture…';
   if($('browse-open')){$('browse-open').disabled=true;$('browse-open').textContent='Ouverture…';}
   const result=await api(`/api/projects/${browse.projectId}/local-catalog/open`,{path:browse.path,patient_id:patientId,timepoint_id:timepointId});
   state.browse={...browse, ...result, patientId:result.patient_id, timepointId:result.timepoint_id};
@@ -177,12 +250,20 @@ async function openAssignment(id){
   const source=exam?.source;
   renderSegState(source);
   if(source?.local_path&&source.local_patient&&source.local_timepoint){
+    const panelOpen=!!state.browse?.panelOpen;
+    const expandedPatient=state.browse?.expandedPatient||'';
     if(!state.browse||state.browse.path!==source.local_path||!state.browse.catalog){
       const catalog=await api(`/api/projects/${row.project_id}/local-catalog?path=${encodeURIComponent(source.local_path)}`);
-      state.browse={projectId:row.project_id, path:source.local_path, catalog};
+      state.browse={projectId:row.project_id, path:source.local_path, catalog, panelOpen, expandedPatient};
     }
     state.browse.patientId=source.local_patient;
     state.browse.timepointId=source.local_timepoint;
+    state.browse.panelOpen=panelOpen;
+    if(!state.browse.expandedPatient) state.browse.expandedPatient=source.local_patient;
+    if(state.browse.panelOpen){
+      await loadPatientSeg(source.local_patient);
+      if(state.browse.expandedPatient!==source.local_patient) await loadPatientSeg(state.browse.expandedPatient);
+    }
   }
   $('viewer').src=`/viewer?study_id=${id}&embedded=1`;await showTab('annotation');
   renderBrowseNav();
@@ -225,6 +306,19 @@ const platform=platformWorkspace({state,api,escape,showModal,action,toast,refres
 
 $('content').addEventListener('click',action(async event=>{
   const button=event.target.closest('button');if(!button||button.dataset.platformAction)return;
+  if(button.dataset.aiProject){
+    const project=cohortProjects().find(item=>item.id===button.dataset.aiProject);
+    showModal('AI segmentation',`<form id="ai-form"><p>TotalSegmentator va parcourir tous les examens CT de ${escape(project?.name||'cette cohorte')}. Les examens tournent l’un après l’autre sur un GPU Kaggle. Les masques déjà présents sont repris.</p><button class="primary">Lancer</button></form>`);
+    $('ai-form').onsubmit=action(async event=>{
+      event.preventDefault();
+      const status=await api(`/api/projects/${button.dataset.aiProject}/ai-segmentation`,{});
+      state.ai[button.dataset.aiProject]=status;
+      $('modal').close();
+      await renderCohorts();
+      toast('Segmentation IA lancée.');
+    });
+    return;
+  }
   if(button.dataset.project){state.project=button.dataset.project;state.status='';state.query='';return showTab('review');}
   if(button.dataset.browseProject)return browseDataset(button.dataset.browseProject);
   if(button.dataset.importProject)return importImages(null, button.dataset.importProject);
@@ -239,13 +333,96 @@ $('content').addEventListener('click',action(async event=>{
 $('navigation').addEventListener('click',action(async event=>{const button=event.target.closest('[data-tab]');if(button){if(button.dataset.tab!=='annotation')await refresh(false);await showTab(button.dataset.tab);}}));
 $('modal-close').onclick=()=>$('modal').close();
 $('back-worklist').onclick=action(async()=>{await refresh(false);await showTab('review');});
-for(const [id,key] of [['browse-prev-patient','previous_patient'],['browse-next-patient','next_patient'],['browse-prev-time','previous_timepoint'],['browse-next-time','next_timepoint']]){
-  $(id).onclick=action(async()=>{const target=state.browse?.[key];if(target) await openBrowsed(target);});
-}
+$('browse-menu').onclick=action(async()=>{
+  if(!state.browse?.catalog) return;
+  state.browse.panelOpen=!state.browse.panelOpen;
+  if(state.browse.panelOpen){
+    state.browse.expandedPatient=state.browse.expandedPatient||state.browse.patientId;
+    if(state.browse.expandedPatient) await loadPatientSeg(state.browse.expandedPatient);
+  }
+  renderBrowseNav();
+});
+$('browse-panel').onclick=action(async event=>{
+  const patient=event.target.closest('[data-browse-patient]');
+  if(patient){
+    const id=patient.dataset.browsePatient;
+    state.browse.expandedPatient=state.browse.expandedPatient===id?'':id;
+    if(state.browse.expandedPatient) await loadPatientSeg(id);
+    renderBrowseNav();
+    return;
+  }
+  const timepoint=event.target.closest('[data-browse-time]');
+  if(timepoint) await openBrowsed({patient_id:timepoint.dataset.browseOwner, timepoint_id:timepoint.dataset.browseTime});
+});
+document.addEventListener('click', event=>{
+  if(!state.browse?.panelOpen||event.target.closest('#browse-nav')) return;
+  state.browse.panelOpen=false;
+  renderBrowseNav();
+});
 $('refresh-assignment').onclick=action(async()=>{await refresh(false);await openAssignment(state.assignment.id);});
 function huText(value){return Number(value).toLocaleString('fr-FR',{maximumFractionDigits:1});}
 let detectionTimer=0;
 let detectionSeen='';
+let detectionClock=null;
+let detectionTick=0;
+let detectionDismissed=false;
+function formatDuration(seconds){
+  const total=Math.max(0,Math.floor(seconds));
+  const hours=Math.floor(total/3600);
+  const minutes=Math.floor(total%3600/60);
+  const rest=total%60;
+  const pad=value=>String(value).padStart(2,'0');
+  return `${pad(hours)}:${pad(minutes)}:${pad(rest)}`;
+}
+function rememberClock(status){
+  const frozen=status.state!=='running';
+  if(typeof status.elapsed_s==='number') detectionClock={elapsed:status.elapsed_s, at:performance.now(), frozen};
+  else if(!detectionClock) detectionClock={elapsed:0, at:performance.now(), frozen};
+  else detectionClock.frozen=frozen;
+}
+function shownElapsed(){
+  if(!detectionClock) return 0;
+  if(detectionClock.frozen) return detectionClock.elapsed;
+  return detectionClock.elapsed+(performance.now()-detectionClock.at)/1000;
+}
+function paintDetectionClock(){
+  const node=$('detection-time');
+  if(node) node.textContent=`Temps écoulé ${formatDuration(shownElapsed())}`;
+}
+function renderDetection(status){
+  const running=status.state==='running';
+  $('detection-title').textContent=running?'Détection en cours':status.state==='error'?'Détection interrompue':'Détection terminée';
+  $('detection-detail').textContent=status.detail||(running?'Préparation de l’examen…':'');
+  const known=typeof status.percent==='number';
+  const percent=known?Math.max(0,Math.min(100,Math.round(status.percent))):0;
+  $('detection-percent').textContent=known?`${percent} %`:'Calcul en cours';
+  $('detection-bar').style.width=known?`${percent}%`:'40%';
+  const error=$('detection-error');
+  error.hidden=!status.error;
+  error.textContent=status.error||'';
+  rememberClock(status);
+  paintDetectionClock();
+  const dice=$('detection-dice');
+  if(!running && typeof status.dice==='number'){
+    dice.hidden=false;
+    dice.textContent=`Score Dice ${status.dice.toLocaleString('fr-FR',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+  }else{dice.hidden=true;dice.textContent='';}
+  window.clearInterval(detectionTick);
+  if(running) detectionTick=window.setInterval(paintDetectionClock,1000);
+}
+function openDetection(status){
+  detectionDismissed=false;
+  if(!$('detection-dialog').open) $('detection-dialog').showModal();
+  renderDetection(status);
+}
+function hideDetection(){
+  window.clearInterval(detectionTick);
+  if($('detection-dialog').open) $('detection-dialog').close();
+}
+function closeDetection(){
+  detectionDismissed=true;
+  hideDetection();
+}
 function showDetection(status){
   const button=$('assignment-detect');
   button.disabled=status.state==='running';
@@ -259,7 +436,12 @@ async function watchDetection(id){
     const status=await api(`/api/studies/${id}/autoseg`);
     if(state.assignment?.id!==id) return;
     showDetection(status);
-    if(status.state==='running') detectionTimer=window.setTimeout(()=>watchDetection(id),4000);
+    if(status.state==='running'){
+      detectionTimer=window.setTimeout(()=>watchDetection(id),1500);
+      if(!detectionDismissed) openDetection(status);
+      else if($('detection-dialog').open) renderDetection(status);
+    }
+    if((status.state==='done'||status.state==='error')&&$('detection-dialog').open) renderDetection(status);
     if(status.state==='done'){
       $('viewer').contentWindow?.postMessage({type:'oncometra:load-organs',seeded:!!status.seeded},location.origin);
       if(detectionSeen==='running') toast(status.detail||'Organes affichés. Maintenez 3 secondes sur un organe pour ne garder que lui.');
@@ -272,11 +454,13 @@ async function watchDetection(id){
 }
 $('assignment-detect').onclick=action(async()=>{
   if(!state.assignment) return;
+  openDetection({state:'running', detail:'Préparation de l’examen…', percent:1, elapsed_s:0});
   const status=await api(`/api/studies/${state.assignment.id}/autoseg`,{});
   showDetection(status);
-  toast(status.state==='running'?'Détection lancée pour cet examen seulement. Comptez plusieurs minutes.':'Détection déjà en cours.');
+  openDetection(status);
   watchDetection(state.assignment.id);
 });
+$('detection-close').onclick=closeDetection;
 $('assignment-organs').onclick=action(async()=>{
   if(!state.assignment) return;
   const result=await api(`/api/studies/${state.assignment.id}/organs`);

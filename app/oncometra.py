@@ -694,6 +694,16 @@ def local_catalog(project_id: str, path: str = "", user=Depends(current_user)):
         raise HTTPException(422, str(error)) from error
 
 
+@app.get("/api/projects/{project_id}/local-catalog/patient")
+def local_catalog_patient(project_id: str, path: str = "", patient_id: str = "", user=Depends(current_user)):
+    from app.services.local_dicom_import import patient_navigation
+    require_project(user, project_id)
+    try:
+        return patient_navigation(project_id, path, patient_id)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
 class LocalExam(BaseModel):
     path: str = Field(min_length=1, max_length=300)
     patient_id: str = Field(min_length=1, max_length=200)
@@ -719,6 +729,25 @@ def open_local_exam(project_id: str, req: LocalExam, user=Depends(current_user))
         audit(db, account, "local_exam_opened", assignment.study_id, {"patient": req.patient_id, "timepoint": req.timepoint_id})
         db.commit()
         return {"study_id": assignment.study_id, **position}
+
+
+@app.post("/api/projects/{project_id}/ai-segmentation", status_code=202)
+def start_ai_segmentation(project_id: str, user=Depends(current_user)):
+    from app.services.cohort_autoseg import CohortAutosegError, start_cohort
+    require_admin(user)
+    require_project(user, project_id)
+    try:
+        return start_cohort(project_id, user.id)
+    except CohortAutosegError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.get("/api/projects/{project_id}/ai-segmentation")
+def ai_segmentation_status(project_id: str, user=Depends(current_user)):
+    from app.services.cohort_autoseg import cohort_status
+    require_admin(user)
+    require_project(user, project_id)
+    return cohort_status(project_id)
 
 
 @app.get("/api/studies/{study_id}/organs")
@@ -1149,6 +1178,8 @@ def main():
     """Start the workspace with whatever `python` is on PATH."""
     os.environ.setdefault("DEMO_EPHEMERAL", "false")
     os.environ.setdefault("CATALOG_WORKER_MODE", "inline")
+    from app.services.kaggle_autoseg import prefer_remote_gpu
+    prefer_remote_gpu()
     import uvicorn
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "8020"))

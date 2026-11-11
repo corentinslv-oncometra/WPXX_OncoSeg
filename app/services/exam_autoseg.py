@@ -1,7 +1,8 @@
 """Organ HU and a cancer-specific lesion mask for one exam.
 
-TotalSegmentator runs on the CPU in its own environment. A reader can start it
-for the open exam; the validation page never launches it for a whole cohort.
+TotalSegmentator runs on the CPU in its own environment, or on a private Kaggle
+GPU when ONCOMETRA_TOTALSEG_DEVICE=kaggle. A reader can start it for the open
+exam. The cohort page can send every CT exam of one cohort, one after another.
 An existing DICOM SEG tumor stays in place so the automatic lesion can be compared with it.
 """
 
@@ -10,9 +11,12 @@ from __future__ import annotations
 from functools import lru_cache
 import json
 import logging
+import os
 from pathlib import Path
+import re
 import subprocess
 import threading
+import time
 
 import numpy as np
 import SimpleITK as sitk
@@ -37,6 +41,13 @@ def autoseg_root() -> Path:
 
 def series_result_dir(series_uid: str) -> Path:
     return autoseg_root() / series_uid
+
+
+def segmentation_device() -> str:
+    forced = (os.environ.get("ONCOMETRA_TOTALSEG_DEVICE") or os.environ.get("ONCORADAR_TOTALSEG_DEVICE") or "").strip().lower()
+    if forced in {"cpu", "gpu", "mps", "kaggle"}:
+        return forced
+    return "cpu"
 
 
 def lesion_task_for_cancer(cancer: str) -> tuple[str, tuple[str, ...]] | None:
@@ -164,6 +175,28 @@ def attach_stored_result(case_id: str) -> None:
             db.commit()
 
 
+def dice_score(prediction, reference) -> float | None:
+    """Overlap of the detected lesion and the reference segment. 1 is a perfect match."""
+    predicted = np.asarray(prediction).astype(bool)
+    truth = np.asarray(reference).astype(bool)
+    if predicted.shape != truth.shape:
+        return None
+    denominator = int(predicted.sum()) + int(truth.sum())
+    if denominator == 0:
+        return None
+    return 2 * int(np.logical_and(predicted, truth).sum()) / denominator
+
+
+def _reference_mask(folder: Path, image):
+    path = folder / "reference.nii.gz"
+    if not path.is_file():
+        return None
+    mask = sitk.GetArrayFromImage(on_reference_grid(image, sitk.ReadImage(str(path))))
+    if mask.shape != tuple(reversed(image.GetSize())):
+        return None
+    return mask > 0
+
+
 def organ_color(label_id: int) -> list[int]:
     """Stable distinct color. The same TotalSegmentator label keeps the same hue."""
     hue = (float(label_id) * 137.508) % 360.0
@@ -179,46 +212,134 @@ def organ_color(label_id: int) -> list[int]:
     return [int(round((channel + base) * 255)) for channel in (red, green, blue)]
 
 
-def run_totalseg(task: str, source: Path, output: Path, *, fast: bool) -> None:
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_PERCENT = re.compile(r"(?<!\d)(\d{1,3})(?:\.\d+)?\s*%")
+
+
+def output_percent(line: str) -> int | None:
+    """Read a tqdm percentage. Later bars in the same run are ignored by the caller."""
+    match = _PERCENT.search(_ANSI.sub("", line))
+    if match is None:
+        return None
+    value = int(match.group(1))
+    return value if value <= 100 else None
+
+
+def span_percent(low: int, high: int, inner: int) -> int:
+    inner = max(0, min(100, int(inner)))
+    return int(round(low + (high - low) * inner / 100))
+
+
+def remote_percent(detail: str) -> int:
+    """Coarse place of a Kaggle job. The notebook itself does not report a percentage."""
+    if detail.startswith("Préparation du volume"):
+        return 8
+    if detail.startswith("Envoi du volume"):
+        return 18
+    if detail.startswith("Démarrage du notebook"):
+        return 30
+    if "QUEUED" in detail or "PENDING" in detail:
+        return 40
+    if "RUNNING" in detail:
+        return 62
+    if detail.startswith("Récupération"):
+        return 88
+    if detail.startswith("GPU Kaggle"):
+        return 50
+    return 12
+
+
+def run_totalseg(task: str, source: Path, output: Path, *, fast: bool, on_progress=None) -> None:
     command = [str(totalseg_cli()), "-i", str(source), "-o", str(output), "-ta", task,
                "--ml", "--statistics", "--statistics_extra", "--device", "cpu"]
     if fast:
         command.append("--fast")
     output.parent.mkdir(parents=True, exist_ok=True)
-    completed = subprocess.run(command, capture_output=True, text=True)
-    if completed.returncode:
-        lines = [line.strip() for line in (completed.stderr or completed.stdout or "").splitlines() if line.strip()]
-        detail = lines[-1][:240] if lines else f"code {completed.returncode}"
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+    pending = b""
+    tail: list[str] = []
+    try:
+        assert process.stdout is not None
+        while True:
+            chunk = process.stdout.read(4096)
+            if not chunk:
+                break
+            pending += chunk
+            pieces = re.split(br"[\r\n]", pending)
+            pending = pieces.pop()
+            for piece in pieces:
+                _read_progress(piece, tail, on_progress)
+        if pending.strip():
+            _read_progress(pending, tail, on_progress)
+        code = process.wait()
+    finally:
+        if process.poll() is None:
+            process.kill()
+    if code:
+        detail = tail[-1][:240] if tail else f"code {code}"
         raise RuntimeError(f"TotalSegmentator a échoué ({task}) : {detail}")
+
+
+def _read_progress(piece: bytes, tail: list[str], on_progress) -> None:
+    text = _ANSI.sub("", piece.decode("utf-8", "replace")).strip()
+    if not text:
+        return
+    tail.append(text)
+    del tail[:-8]
+    percent = output_percent(text)
+    if percent is not None and on_progress is not None:
+        on_progress(percent)
 
 
 def detection_status(case_id: str) -> dict:
     with _status_lock:
         current = _status.get(case_id)
         if current:
-            return dict(current)
-    return {"state": "idle", "detail": "", "error": "", "seeded": False}
+            payload = dict(current)
+        else:
+            payload = {"state": "idle", "detail": "", "error": "", "seeded": False, "percent": 0}
+    started = payload.get("started_at")
+    if started:
+        end = payload.get("finished_at") or time.time()
+        payload["elapsed_s"] = max(0, int(end - started))
+    else:
+        payload["elapsed_s"] = 0
+    payload.setdefault("percent", 0)
+    return payload
 
 
 def _set_status(case_id: str, **fields) -> None:
     with _status_lock:
-        current = dict(_status.get(case_id) or {"state": "idle", "detail": "", "error": "", "seeded": False})
+        current = dict(_status.get(case_id) or {"state": "idle", "detail": "", "error": "", "seeded": False, "percent": 0})
+        if "percent" in fields and current.get("state") == "running" and fields.get("state", "running") == "running":
+            fields["percent"] = max(int(current.get("percent") or 0), int(fields["percent"]))
+        if fields.get("state") == "done":
+            fields["percent"] = 100
+            fields.setdefault("finished_at", time.time())
+        elif fields.get("state") == "error":
+            fields.setdefault("finished_at", time.time())
         current.update(fields)
         _status[case_id] = current
 
 
 def start_detection(case_id: str, study_id: str) -> dict:
     global _active_case
+    launch = False
     with _status_lock:
         active = _status.get(_active_case or "", {})
         if _active_case and _active_case != case_id and active.get("state") == "running":
             raise RuntimeError("Une détection est déjà en cours sur un autre examen.")
         current = _status.get(case_id) or {}
-        if current.get("state") == "running":
-            return dict(current)
-        _active_case = case_id
-        _status[case_id] = {"state": "running", "detail": "Préparation de l’examen…", "error": "", "seeded": False}
-    threading.Thread(target=_detect_worker, args=(case_id, study_id), daemon=True).start()
+        if current.get("state") != "running":
+            _active_case = case_id
+            detail = "Préparation de l’envoi vers un GPU Kaggle…" if segmentation_device() == "kaggle" else "Préparation de l’examen…"
+            _status[case_id] = {
+                "state": "running", "detail": detail, "error": "", "seeded": False,
+                "percent": 1, "started_at": time.time(),
+            }
+            launch = True
+    if launch:
+        threading.Thread(target=_detect_worker, args=(case_id, study_id), daemon=True).start()
     return detection_status(case_id)
 
 
@@ -226,7 +347,7 @@ def _detect_worker(case_id: str, study_id: str) -> None:
     global _active_case
     try:
         result = execute_case(case_id, study_id, report=_set_status)
-        _set_status(case_id, state="done", detail=result["detail"], error="", seeded=result["seeded"])
+        _set_status(case_id, state="done", detail=result["detail"], error="", seeded=result["seeded"], dice=result.get("dice"))
     except Exception as error:
         logger.exception("Automatic detection failed for %s", case_id)
         _set_status(case_id, state="error", detail="", error=str(error), seeded=False)
@@ -258,10 +379,44 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
     uid = str(source.get("series_instance_uid") or case_id)
     stored = series_result_dir(uid)
     stored.mkdir(parents=True, exist_ok=True)
-    report(case_id, state="running", detail="Segmentation des organes…")
+    chosen = lesion_task_for_cancer(cancer)
+    has_lesions = chosen is not None
+    organ_low, organ_high = (4, 46) if has_lesions else (4, 90)
+    lesion_low, lesion_high = 48, 92
+    sent = {"percent": 1}
+
+    def emit(percent: int, detail: str) -> None:
+        percent = max(sent["percent"], int(percent))
+        sent["percent"] = percent
+        report(case_id, state="running", detail=detail, error="", seeded=False, percent=percent)
+
+    def segment(task: str, source_path: Path, output: Path, *, fast: bool, low: int, high: int, detail: str) -> None:
+        peak = {"value": -1}
+
+        def on_progress(inner: int) -> None:
+            if inner <= peak["value"]:
+                return
+            peak["value"] = inner
+            emit(span_percent(low, high, inner), detail)
+
+        emit(low, detail)
+        if runner is run_totalseg:
+            run_totalseg(task, source_path, output, fast=fast, on_progress=on_progress)
+        else:
+            runner(task, source_path, output, fast=fast)
+        emit(high, detail)
+
+    if segmentation_device() == "kaggle":
+        from app.services.kaggle_autoseg import ensure_remote_masks
+        ensure_remote_masks(
+            image_path, uid, chosen[0] if chosen else None, stored,
+            report=lambda detail: emit(remote_percent(detail), detail),
+        )
     organs_path = stored / "organs.nii.gz"
-    if not organs_path.is_file():
-        runner(ORGAN_TASK, image_path, organs_path, fast=True)
+    if organs_path.is_file():
+        emit(organ_high, "Organes déjà calculés.")
+    else:
+        segment(ORGAN_TASK, image_path, organs_path, fast=True, low=organ_low, high=organ_high, detail="Segmentation des organes…")
     names = class_names(ORGAN_TASK)
     labels = sitk.GetArrayFromImage(on_reference_grid(image, sitk.ReadImage(str(organs_path))))
     labels = np.rint(labels).astype(np.uint16)
@@ -277,18 +432,18 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
     seeded = False
     lesion_mask = None
     seg_kept = bool(source.get("seg_used") or source.get("tumor_from_seg"))
-    chosen = lesion_task_for_cancer(cancer)
     if chosen is None:
         tumor_note = "Aucun modèle ouvert de lésion ne correspond à ce type de cancer."
         if seg_kept:
             tumor_note += " Le segment SEG est conservé."
     else:
         tumor_task, needles = chosen
-        report(case_id, state="running", detail="Segmentation des lésions…")
         lesions_path = stored / "lesions.nii.gz"
-        if not lesions_path.is_file():
+        if lesions_path.is_file():
+            emit(lesion_high, "Lésions déjà calculées.")
+        else:
             try:
-                runner(tumor_task, image_path, lesions_path, fast=False)
+                segment(tumor_task, image_path, lesions_path, fast=False, low=lesion_low, high=lesion_high, detail="Segmentation des lésions…")
             except Exception as error:
                 tumor_note = f"Organes prêts. La détection des lésions a échoué : {error}"
                 if seg_kept:
@@ -319,6 +474,16 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
                 tumor_note = f"La tâche {tumor_task} n’a trouvé aucune lésion."
                 if seg_kept:
                     tumor_note += " Le segment SEG est conservé."
+    dice = None
+    if lesion_mask is not None:
+        reference = _reference_mask(folder, image)
+        if reference is None:
+            tumor_note += " Score Dice non calculé : aucun segment SEG de référence."
+        else:
+            dice = dice_score(lesion_mask, reference)
+            if dice is not None:
+                shown = f"{dice:.2f}".replace(".", ",")
+                tumor_note += f" Score Dice {shown} par rapport au segment SEG."
     if lesion_mask is not None:
         labels = organ_labels.copy()
         labels[lesion_mask > 0] = np.uint16(65000)
@@ -326,17 +491,17 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
     volume = sitk.GetImageFromArray(labels)
     volume.CopyInformation(image)
     sitk.WriteImage(volume, str(folder / "organ_labels.nii.gz"), True)
-    report(case_id, state="running", detail="Calcul des unités Hounsfield…")
+    emit(96, "Calcul des unités Hounsfield…")
     payload = {
         "cancer": cancer, "organ_task": ORGAN_TASK, "organ_mode": "fast", "device": "cpu",
-        "tumor_task": tumor_task, "tumor_note": tumor_note, "legend": legend,
+        "tumor_task": tumor_task, "tumor_note": tumor_note, "dice": dice, "legend": legend,
         "organs": hu_rows(sitk.GetArrayFromImage(image), organ_labels, names, voxel_mm3),
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     (folder / "organs.json").write_text(text, encoding="utf-8")
     (stored / "hu.json").write_text(text, encoding="utf-8")
     detail = f"{len(present)} organes colorés. {tumor_note}"
-    return {"detail": detail, "seeded": seeded}
+    return {"detail": detail, "seeded": seeded, "dice": dice}
 
 
 AI_LESION_NAME = "AI lesion detection"
@@ -402,4 +567,19 @@ def organ_overlay(case_dir: Path) -> dict | None:
     labels = case_dir / "organ_labels.nii.gz"
     if not table or not labels.is_file() or not table.get("legend"):
         return None
-    return {"legend": table["legend"], "encoding": "uint16-le", "tumor_note": table.get("tumor_note") or ""}
+    detected = any(int(item.get("id", 0)) == 65000 for item in table["legend"])
+    return {
+        "legend": table["legend"], "encoding": "uint16-le", "tumor_note": table.get("tumor_note") or "",
+        "ai_detected": detected, "dice": _dice_against_reference(case_dir) if detected else None,
+    }
+
+
+def _dice_against_reference(case_dir: Path) -> float | None:
+    labels_path = case_dir / "organ_labels.nii.gz"
+    reference_path = case_dir / "reference.nii.gz"
+    if not labels_path.is_file() or not reference_path.is_file():
+        return None
+    labels = sitk.ReadImage(str(labels_path))
+    truth = sitk.GetArrayFromImage(on_reference_grid(labels, sitk.ReadImage(str(reference_path)))) > 0
+    predicted = sitk.GetArrayFromImage(labels) == 65000
+    return dice_score(predicted, truth)

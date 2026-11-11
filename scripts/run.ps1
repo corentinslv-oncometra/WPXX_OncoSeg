@@ -29,6 +29,7 @@ if ($missingDeps) {
     & $venvPython -m pip install -r requirements-demo.txt
 }
 
+if (-not $env:ONCOMETRA_TOTALSEG_DEVICE) { $env:ONCOMETRA_TOTALSEG_DEVICE = "cpu" }
 New-Item -ItemType Directory -Force -Path ".\data" | Out-Null
 $env:APP_STORAGE_ROOT = (Resolve-Path ".\data").Path
 $env:DEMO_EPHEMERAL = "false"
