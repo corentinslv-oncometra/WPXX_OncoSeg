@@ -756,8 +756,15 @@ def study_organs(study_id: UUID, user=Depends(current_user)):
     with SessionLocal() as db:
         _, case = get_assignment(db, study_id, user)
         payload = load_organ_table(image_directory(case))
+        folder = image_directory(case)
+        seg_reference = bool((case.source or {}).get("tumor_from_seg"))
     if payload is None:
         raise HTTPException(404, "Cet examen n’a pas encore de mesures d’organes.")
+    from app.services.exam_autoseg import _dice_against_reference, _note_for_display, _with_ai_color
+    detected = any(int(item.get("id", 0)) == 65000 for item in payload.get("legend") or [])
+    dice = _dice_against_reference(folder) if detected and seg_reference else None
+    payload = {**payload, "legend": _with_ai_color(payload.get("legend") or []), "dice": dice,
+               "tumor_note": _note_for_display(payload.get("tumor_note") or "", dice)}
     return payload
 
 
@@ -786,7 +793,8 @@ def study_organ_overlay(study_id: UUID, user=Depends(current_user)):
     from app.services.exam_autoseg import organ_overlay
     with SessionLocal() as db:
         _, case = get_assignment(db, study_id, user)
-        payload = organ_overlay(image_directory(case))
+        seg_reference = bool((case.source or {}).get("tumor_from_seg"))
+        payload = organ_overlay(image_directory(case), seg_reference=seg_reference)
     if payload is None:
         raise HTTPException(404, "Cet examen n’a pas encore de carte d’organes.")
     return payload

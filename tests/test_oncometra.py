@@ -531,7 +531,7 @@ def test_one_exam_detection_publishes_distinct_organ_colors(clients, monkeypatch
     legend = overlay.json()["legend"]
     assert [item["label"] for item in legend] == ["liver", "spleen", "Lésion"]
     assert legend[0]["color"] != legend[1]["color"]
-    assert legend[2]["color"] == [220, 0, 0]
+    assert legend[2]["color"] == [0, 188, 255]
     voxels = admin.get(f"/api/studies/{study}/organ-overlay/voxels")
     assert voxels.status_code == 200
     payload = voxels.content

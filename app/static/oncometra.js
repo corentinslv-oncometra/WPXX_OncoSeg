@@ -91,7 +91,7 @@ async function renderCohorts(){
       : '';
     return `<tr><td><strong>${escape(project.name)}</strong><small>${escape(project.dataset.name)} · ${project.modality==='MR'?'IRM':'CT'}</small>${gaps.length?`<small>Encore : ${escape(gaps.join(', '))}</small>`:''}</td><td><span class="status ${status.id}">${escape(status.label)}</span></td><td>${project.cases}</td><td>${project.approved}</td><td><div class="row-actions">${aiButton}<button data-browse-project="${project.id}">Choisir un patient</button><button data-import-project="${project.id}">Importer des fichiers</button>${project.cases?`<button data-project="${project.id}">Voir les examens</button>`:''}</div></td></tr>`;
   }).join('');
-  $('content').innerHTML=heading('Cohortes','Les datasets que vous avez choisis.')+`<section class="table-panel">${cohorts.length?`<div class="table-scroll"><table><thead><tr><th>Cohorte</th><th>État</th><th>Images</th><th>Validés</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="empty"><h2>Aucune cohorte</h2><p>'+(state.user.role==='admin'?'Choisissez un dataset exploitable.':'Aucune cohorte n’est encore ouverte.')+'</p></div>'}</section><p class="small-note">AI segmentation envoie tous les examens CT de la cohorte sur un GPU Kaggle, un examen à la fois. Le segment SEG déjà présent est conservé pour la comparaison. Les masques déjà calculés ne sont pas relancés.</p>`;
+  $('content').innerHTML=heading('Cohortes','Les datasets que vous avez choisis.')+`<section class="table-panel">${cohorts.length?`<div class="table-scroll"><table><thead><tr><th>Cohorte</th><th>État</th><th>Images</th><th>Validés</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="empty"><h2>Aucune cohorte</h2><p>'+(state.user.role==='admin'?'Choisissez un dataset exploitable.':'Aucune cohorte n’est encore ouverte.')+'</p></div>'}</section><p class="small-note">AI segmentation envoie les examens CT un par un sur un GPU Kaggle. Dès que la segmentation d’un examen est revenue, ses masques sont rangés dans la visionneuse. Le segment SEG déjà présent est conservé pour la comparaison. Les masques déjà calculés ne sont pas relancés.</p>`;
   watchAi();
 }
 
@@ -308,7 +308,7 @@ $('content').addEventListener('click',action(async event=>{
   const button=event.target.closest('button');if(!button||button.dataset.platformAction)return;
   if(button.dataset.aiProject){
     const project=cohortProjects().find(item=>item.id===button.dataset.aiProject);
-    showModal('AI segmentation',`<form id="ai-form"><p>TotalSegmentator va parcourir tous les examens CT de ${escape(project?.name||'cette cohorte')}. Les examens tournent l’un après l’autre sur un GPU Kaggle. Les masques déjà présents sont repris.</p><button class="primary">Lancer</button></form>`);
+    showModal('AI segmentation',`<form id="ai-form"><p>TotalSegmentator va parcourir tous les examens CT de ${escape(project?.name||'cette cohorte')}. Chaque examen part seul sur un GPU Kaggle. Ses masques sont rangés dans la visionneuse dès le retour du calcul, avant l’examen suivant. Les masques déjà présents sont repris.</p><button class="primary">Lancer</button></form>`);
     $('ai-form').onsubmit=action(async event=>{
       event.preventDefault();
       const status=await api(`/api/projects/${button.dataset.aiProject}/ai-segmentation`,{});

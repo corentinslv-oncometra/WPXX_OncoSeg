@@ -121,9 +121,44 @@ def class_names(task: str) -> dict[int, str]:
 
 
 def on_reference_grid(reference, moving):
-    if tuple(int(n) for n in moving.GetSize()) == tuple(int(n) for n in reference.GetSize()) and np.allclose(moving.GetOrigin(), reference.GetOrigin(), atol=1e-2) and np.allclose(moving.GetSpacing(), reference.GetSpacing(), atol=1e-3) and np.allclose(moving.GetDirection(), reference.GetDirection(), atol=1e-4):
+    if mask_matches_image(reference, moving):
         return moving
     return sitk.Resample(moving, reference, sitk.Transform(), sitk.sitkNearestNeighbor, 0, moving.GetPixelID())
+
+
+def mask_matches_image(reference, moving) -> bool:
+    """True when both volumes share the exam grid. A foreign mask must not be resampled onto it."""
+    return (
+        tuple(int(n) for n in moving.GetSize()) == tuple(int(n) for n in reference.GetSize())
+        and np.allclose(moving.GetOrigin(), reference.GetOrigin(), atol=1e-2)
+        and np.allclose(moving.GetSpacing(), reference.GetSpacing(), atol=1e-3)
+        and np.allclose(moving.GetDirection(), reference.GetDirection(), atol=1e-4)
+    )
+
+
+def _image_header(path: Path):
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(str(path))
+    reader.ReadImageInformation()
+    return reader
+
+
+def discard_foreign_mask(image: Path, mask: Path) -> bool:
+    """Delete a mask that is not on this exam's grid. Returns True when the file was removed."""
+    if not image.is_file() or not mask.is_file():
+        return False
+    exam = _image_header(image)
+    moving = _image_header(mask)
+    same = (
+        tuple(int(n) for n in moving.GetSize()) == tuple(int(n) for n in exam.GetSize())
+        and np.allclose(moving.GetOrigin(), exam.GetOrigin(), atol=1e-2)
+        and np.allclose(moving.GetSpacing(), exam.GetSpacing(), atol=1e-3)
+        and np.allclose(moving.GetDirection(), exam.GetDirection(), atol=1e-4)
+    )
+    if same:
+        return False
+    mask.unlink()
+    return True
 
 
 def load_organ_table(case_dir: Path) -> dict | None:
@@ -379,6 +414,8 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
     uid = str(source.get("series_instance_uid") or case_id)
     stored = series_result_dir(uid)
     stored.mkdir(parents=True, exist_ok=True)
+    discard_foreign_mask(image_path, stored / "organs.nii.gz")
+    discard_foreign_mask(image_path, stored / "lesions.nii.gz")
     chosen = lesion_task_for_cancer(cancer)
     has_lesions = chosen is not None
     organ_low, organ_high = (4, 46) if has_lesions else (4, 90)
@@ -475,11 +512,9 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
                 if seg_kept:
                     tumor_note += " Le segment SEG est conservé."
     dice = None
-    if lesion_mask is not None:
+    if lesion_mask is not None and seg_kept:
         reference = _reference_mask(folder, image)
-        if reference is None:
-            tumor_note += " Score Dice non calculé : aucun segment SEG de référence."
-        else:
+        if reference is not None:
             dice = dice_score(lesion_mask, reference)
             if dice is not None:
                 shown = f"{dice:.2f}".replace(".", ",")
@@ -487,7 +522,7 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
     if lesion_mask is not None:
         labels = organ_labels.copy()
         labels[lesion_mask > 0] = np.uint16(65000)
-        legend.append({"id": 65000, "name": "lesion", "label": "Lésion", "color": [220, 0, 0]})
+        legend.append({"id": 65000, "name": "lesion", "label": "Lésion", "color": [0, 188, 255]})
     volume = sitk.GetImageFromArray(labels)
     volume.CopyInformation(image)
     sitk.WriteImage(volume, str(folder / "organ_labels.nii.gz"), True)
@@ -562,15 +597,37 @@ def _record_ai_lesion(study_id: str, lesion_mask) -> str:
         return "added"
 
 
-def organ_overlay(case_dir: Path) -> dict | None:
+_DICE_NOTE = re.compile(r"\s*Score Dice[^.]+\.")
+AI_CYAN = [0, 188, 255]
+
+
+def _with_ai_color(legend: list) -> list:
+    shown = []
+    for item in legend:
+        if int(item.get("id", 0)) == 65000:
+            item = {**item, "color": AI_CYAN}
+        shown.append(item)
+    return shown
+
+
+def _note_for_display(note: str, dice: float | None) -> str:
+    text = note or ""
+    if dice is None:
+        text = _DICE_NOTE.sub("", text).strip()
+    return text
+
+
+def organ_overlay(case_dir: Path, *, seg_reference: bool = False) -> dict | None:
     table = load_organ_table(case_dir)
     labels = case_dir / "organ_labels.nii.gz"
     if not table or not labels.is_file() or not table.get("legend"):
         return None
     detected = any(int(item.get("id", 0)) == 65000 for item in table["legend"])
+    dice = _dice_against_reference(case_dir) if detected and seg_reference else None
     return {
-        "legend": table["legend"], "encoding": "uint16-le", "tumor_note": table.get("tumor_note") or "",
-        "ai_detected": detected, "dice": _dice_against_reference(case_dir) if detected else None,
+        "legend": _with_ai_color(table["legend"]), "encoding": "uint16-le",
+        "tumor_note": _note_for_display(table.get("tumor_note") or "", dice),
+        "ai_detected": detected, "dice": dice,
     }
 
 

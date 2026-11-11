@@ -217,11 +217,10 @@ async function loadOrgans() {
 function renderLesionDice() {
   const node = $("lesion-dice");
   if (!node) return;
-  if (!state.aiDetected) { node.hidden = true; node.textContent = ""; return; }
+  const tumor = (state.meta?.nodules || []).some(isRecordedTumor);
+  if (!tumor || typeof state.lesionDice !== "number") { node.hidden = true; node.textContent = ""; return; }
   node.hidden = false;
-  node.textContent = typeof state.lesionDice === "number"
-    ? `Score Dice ${state.lesionDice.toLocaleString("fr-FR", {minimumFractionDigits: 2, maximumFractionDigits: 2})}`
-    : "Score Dice non calculé : aucun segment SEG.";
+  node.textContent = `Score Dice ${state.lesionDice.toLocaleString("fr-FR", {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
 }
 const ORGAN_BOX_GREEN = "#39FF14";
 function lesionLabels() {
@@ -386,7 +385,7 @@ function reconcileNodules() {
   selectJob();
   if (previous !== state.selectedNodule || !state.box) state.box = nodulePrompt();
   state.noduleColors = Object.fromEntries((state.meta?.nodules || []).map((nodule) => [nodule.label, nodule.color]));
-  state.displayVersion++; renderNodules();
+  state.displayVersion++; renderNodules(); renderLesionDice();
 }
 function selectNodule(label, jump = true) {
   if (state.busy || state.loading || pendingPoint || pointSave || views.some((view) => view.drag)) return;
@@ -501,10 +500,8 @@ function renderView(view) {
   const targetLabel = state.preview ? jobNoduleLabel(state.job) : null;
   const colors = {...state.noduleColors, 256: [255, 102, 94], 257: [245, 186, 85]};
   const tumorRed = [220, 0, 0];
-  const detectedOnly = [0, 188, 255];
-  const agreement = [255, 214, 0];
+  const aiCyan = [0, 188, 255];
   const tumorLabels = new Set((state.meta?.nodules || []).filter(isRecordedTumor).map((nodule) => nodule.label));
-  const compare = tumorLabels.size > 0 && Boolean(state.organNames[65000]);
   const opacityControl = $("overlay-opacity");
   if (opacityControl && opacityControl.dataset.lesionsOpaque !== "1") {
     opacityControl.max = "1";
@@ -516,7 +513,7 @@ function renderView(view) {
   const outlineOrgan = state.organBox?.label || 0;
   const rasterKey = [state.volume, state.mask, overlay, opacity, low, state.window.width, slice,
     state.preview, targetLabel, state.selectedNodule, state.displayVersion, signX, signY,
-    state.organs, state.soloOrgan, state.organVisible, compare, outlineOrgan];
+    state.organs, state.soloOrgan, state.organVisible, outlineOrgan];
   // Zoom, pan and crosshair changes reuse the raster instead of windowing every voxel again.
   if (!view.rasterKey || rasterKey.some((value, i) => value !== view.rasterKey[i])) {
     source.width = width; source.height = height;
@@ -537,11 +534,9 @@ function renderView(view) {
       const organ = state.organs ? state.organs[index] : 0;
       const organIsTumor = organ === 65000;
       const showOrgan = state.organVisible && organ && (!state.soloOrgan || organ === state.soloOrgan);
-      const segHere = Boolean(showMask && tumorLabels.has(label));
       const aiHere = Boolean(showOrgan && organIsTumor);
       let lesionColor = null;
-      if (compare && (segHere || aiHere)) lesionColor = segHere && aiHere ? agreement : segHere ? tumorRed : detectedOnly;
-      else if (aiHere) lesionColor = tumorRed;
+      if (aiHere) lesionColor = aiCyan;
       else if (showMask) lesionColor = color;
       let red = value, green = value, blue = value;
       const organColor = showOrgan && !organIsTumor ? state.organColors[organ] : null;

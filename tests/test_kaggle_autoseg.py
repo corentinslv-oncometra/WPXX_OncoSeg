@@ -88,6 +88,19 @@ def test_masks_land_in_the_series_folder_without_replacing_an_existing_one(tmp_p
     assert "T4" in (dest / "nvidia-smi.csv").read_text(encoding="utf-8")
 
 
+def test_a_shared_mask_file_is_not_given_to_every_exam(tmp_path):
+    download = tmp_path / "output"
+    download.mkdir()
+    (download / "organs.nii.gz").write_bytes(b"shared")
+    with pytest.raises(RuntimeError, match="organs.nii.gz"):
+        kaggle_autoseg.place_outputs(download, "1.2.3", tmp_path / "dest", need_organs=True, need_lesions=False)
+    owned = download / "1.2.3__organs.nii.gz"
+    owned.write_bytes(b"owned")
+    dest = tmp_path / "placed"
+    kaggle_autoseg.place_outputs(download, "1.2.3", dest, need_organs=True, need_lesions=False)
+    assert (dest / "organs.nii.gz").read_bytes() == b"owned"
+
+
 def test_a_failed_notebook_names_the_missing_mask(tmp_path):
     with pytest.raises(RuntimeError, match="lesions.nii.gz"):
         kaggle_autoseg.place_outputs(tmp_path, "uid", tmp_path / "dest", need_organs=False, need_lesions=True)

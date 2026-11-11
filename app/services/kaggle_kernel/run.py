@@ -97,12 +97,12 @@ def main() -> None:
 
         def run_exam(exam) -> None:
             image = _volume(folder, str(exam["file"]))
-            dest = written / str(exam["uid"])
+            uid = str(exam["uid"])
             if exam.get("organs", True):
-                _run(binary, image, dest / "organs.nii.gz", "total")
+                _run(binary, image, written / f"{uid}__organs.nii.gz", "total")
             lesion_task = exam.get("lesion_task")
             if exam.get("lesions") and lesion_task:
-                _run(binary, image, dest / "lesions.nii.gz", str(lesion_task))
+                _run(binary, image, written / f"{uid}__lesions.nii.gz", str(lesion_task))
             elif exam.get("lesions"):
                 raise RuntimeError("La détection des lésions est demandée sans tâche.")
 

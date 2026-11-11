@@ -19,8 +19,8 @@ from app.services.exam_autoseg import lesion_task_for_cancer, series_result_dir
 from app.services.imaging import read_dicom_series_from_dir
 from app.services.storage import DATA_ROOT
 
-# One notebook install, then the exams of that session, one after another.
-CHUNK = 8
+# One exam per Kaggle session, then the masks are written into the viewer before the next exam.
+CHUNK = 1
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 

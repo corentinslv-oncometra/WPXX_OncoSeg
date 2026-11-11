@@ -144,13 +144,16 @@ def place_outputs(download_root: Path, uid: str, dest: Path, *, need_organs: boo
             shutil.copy2(source, target)
     if missing:
         raise RuntimeError("Le notebook GPU n’a pas produit : " + ", ".join(missing))
-    gpu_log = _find_output(download_root, uid, "nvidia-smi.csv")
+    gpu_log = _find_log(download_root)
     if gpu_log is not None and not (dest / "nvidia-smi.csv").is_file():
         shutil.copy2(gpu_log, dest / "nvidia-smi.csv")
 
 
 def ensure_remote_masks(image: Path, uid: str, lesion_task: str | None, dest: Path, report=None) -> None:
     """Run the missing organ and lesion tasks on Kaggle, then copy the NIfTI masks."""
+    from app.services.exam_autoseg import discard_foreign_mask
+    discard_foreign_mask(image, dest / "organs.nii.gz")
+    discard_foreign_mask(image, dest / "lesions.nii.gz")
     need_organs = not (dest / "organs.nii.gz").is_file()
     need_lesions = bool(lesion_task) and not (dest / "lesions.nii.gz").is_file()
     if not need_organs and not need_lesions:
@@ -192,14 +195,17 @@ def ensure_remote_masks(image: Path, uid: str, lesion_task: str | None, dest: Pa
 def ensure_remote_batch(exams: list[dict], report=None) -> None:
     """Run several exams on one Kaggle T4, one after another."""
     pending = []
+    from app.services.exam_autoseg import discard_foreign_mask
     for exam in exams:
         dest = Path(exam["dest"])
+        image = Path(exam["image"])
+        discard_foreign_mask(image, dest / "organs.nii.gz")
+        discard_foreign_mask(image, dest / "lesions.nii.gz")
         lesion_task = exam.get("lesion_task")
         need_organs = not (dest / "organs.nii.gz").is_file()
         need_lesions = bool(lesion_task) and not (dest / "lesions.nii.gz").is_file()
         if not need_organs and not need_lesions:
             continue
-        image = Path(exam["image"])
         if not image.is_file():
             raise RuntimeError(f"Le volume de {exam.get('uid')} est introuvable.")
         pending.append({**exam, "image": image, "dest": dest, "organs": need_organs, "lesions": need_lesions})
@@ -467,10 +473,19 @@ def _kernel_state(response) -> tuple[str, str]:
 
 
 def _find_output(root: Path, uid: str, name: str) -> Path | None:
-    matches = [path for path in root.rglob(name) if path.is_file()]
-    owned = [path for path in matches if path.parent.name == uid]
-    if len(owned) == 1:
-        return owned[0]
+    """A mask is kept only when its name carries this exam. One shared file is not reused."""
+    prefixed = f"{uid}__{name}"
+    matches = [
+        path for path in root.rglob("*")
+        if path.is_file() and (path.name == prefixed or (path.parent.name == uid and path.name == name))
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _find_log(root: Path) -> Path | None:
+    matches = [path for path in root.rglob("nvidia-smi.csv") if path.is_file()]
     if len(matches) == 1:
         return matches[0]
     return None
