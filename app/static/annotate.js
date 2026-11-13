@@ -583,8 +583,7 @@ function renderView(view) {
   const cx = left + (displayX(state.cross[a]) + .5) * dw / width, cy = top + (displayY(state.cross[b]) + .5) * dh / height;
   ctx.save(); ctx.beginPath(); ctx.rect(left, top, dw, dh); ctx.clip();
   const outline = view.organOutline;
-  const predictionVisible = state.organVisible || state.overlay;
-  if (outline?.length && state.organBox && predictionVisible) {
+  if (outline?.length && state.organBox && state.organVisible) {
     const px = dw / width, py = dh / height;
     const radius = Math.max(px, py) * (view.plane === "axial" ? 2.4 : 0.85);
     ctx.save();
