@@ -29,7 +29,8 @@ if ($missingDeps) {
     & $venvPython -m pip install -r requirements-demo.txt
 }
 
-if (-not $env:ONCOMETRA_TOTALSEG_DEVICE) { $env:ONCOMETRA_TOTALSEG_DEVICE = "cpu" }
+# cpu was the previous launcher default. Replace that leftover so Détecter reaches Kaggle.
+if (-not $env:ONCOMETRA_TOTALSEG_DEVICE -or $env:ONCOMETRA_TOTALSEG_DEVICE -eq "cpu") { $env:ONCOMETRA_TOTALSEG_DEVICE = "kaggle" }
 New-Item -ItemType Directory -Force -Path ".\data" | Out-Null
 $env:APP_STORAGE_ROOT = (Resolve-Path ".\data").Path
 $env:DEMO_EPHEMERAL = "false"

@@ -1,0 +1,214 @@
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+import SimpleITK as sitk
+
+from app.services.lesion_tracking import (
+    DISPARUE, NOUVELLE, PROGRESSION, REPONSE, STABLE, Exam, LesionTrackingError, LesionView,
+    SimpleItkAnatomyRegistrar, assign_lesions, dice, extract_instances, load_exam, make_registrar, track, track_folder,
+)
+
+
+class _Identity:
+    def warp_labels(self, fixed, moving, labels):
+        return np.asarray(labels)
+
+
+def _exam(time_id, organs, lesions, ct=None, segments=None, spacing=(1.0, 1.0, 1.0)):
+    organs = np.asarray(organs)
+    ct = np.zeros(organs.shape, np.float32) if ct is None else np.asarray(ct, dtype=np.float32)
+    return Exam(time_id, ct, organs.astype(np.int32), np.asarray(lesions).astype(np.int32), spacing, segments=None if segments is None else np.asarray(segments))
+
+
+def _liver(shape):
+    organs = np.zeros(shape, np.int32)
+    organs[:] = 5
+    return organs
+
+
+def _box(shape, origin, size, value=1):
+    mask = np.zeros(shape, np.int32)
+    z, y, x = origin
+    depth, height, width = size
+    mask[z:z + depth, y:y + height, x:x + width] = value
+    return mask
+
+
+def test_instances_stay_inside_a_dilated_liver_and_drop_speckles():
+    organs = np.zeros((8, 8, 16), np.int32)
+    organs[:, :, 2:7] = 5
+    lesions = np.zeros_like(organs)
+    lesions[:, :, 3:5] = 1
+    lesions[0:2, 0:2, 9] = 1
+    lesions[0:2, 0:2, 14] = 1
+    lesions[0, 0, 6] = 1
+    lesions[0, 1, 6] = 1
+    tight = extract_instances(lesions, organs, (1.0, 1.0, 1.0), dilation_mm=0, min_voxels=4)
+    assert np.count_nonzero(tight[:, :, 3:5]) == int(np.count_nonzero(lesions[:, :, 3:5]))
+    assert np.count_nonzero(tight[:, :, 9:]) == 0
+    dilated = extract_instances(lesions, organs, (1.0, 1.0, 1.0), dilation_mm=3.0, min_voxels=4)
+    assert np.count_nonzero(dilated[:, :, 9]) == 4
+    assert np.count_nonzero(dilated[:, :, 14]) == 0
+    assert np.count_nonzero(dilated[:, :, 6]) == 0
+
+
+def test_assignment_is_one_to_one_and_honours_both_gates():
+    left = np.zeros((4, 4, 6), dtype=bool)
+    right = np.zeros_like(left)
+    left[:, :, 0:2] = True
+    right[:, :, 4:6] = True
+    near = LesionView(1, left, (1.0, 0.0, 0.0))
+    assert assign_lesions([near], [LesionView(7, np.zeros_like(left), (30.0, 0.0, 0.0))]) == []
+    assert assign_lesions([near], [LesionView(7, left, (1.0, 0.0, 0.0))]) == [(1, 7)]
+    assert assign_lesions([near], [LesionView(7, np.zeros_like(left), (10.0, 0.0, 0.0))]) == [(1, 7)]
+    pairs = assign_lesions(
+        [LesionView(1, left, (0.0, 0.0, 0.0)), LesionView(2, right, (0.0, 0.0, 5.0))],
+        [LesionView(10, right, (0.0, 0.0, 5.0)), LesionView(11, left, (0.0, 0.0, 0.0))],
+    )
+    assert sorted(pairs) == [(1, 11), (2, 10)]
+
+
+def test_a_shrunk_lesion_keeps_its_number_and_a_distant_one_is_new():
+    shape = (8, 8, 24)
+    organs = _liver(shape)
+    baseline = _box(shape, (2, 2, 4), (4, 4, 4))
+    shrunk = _box(shape, (3, 3, 5), (2, 2, 2))
+    other = _box(shape, (2, 2, 18), (3, 3, 3))
+    follow = shrunk + other
+    result = track([
+        _exam("t0", organs, baseline, ct=np.full(shape, 40, np.float32)),
+        _exam("t1", organs, follow, ct=np.full(shape, 80, np.float32)),
+    ], registrar=_Identity(), min_voxels=4, dilation_mm=0)
+    assert set(np.unique(result.labels["t1"])) == {0, 1, 2}
+    assert np.array_equal(result.labels["t1"] == 1, shrunk.astype(bool))
+    assert np.array_equal(result.labels["t1"] == 2, other.astype(bool))
+    by_id = {(row.time_id, row.lesion_id): row for row in result.records}
+    assert by_id[("t1", 1)].status == REPONSE
+    assert by_id[("t1", 2)].status == NOUVELLE
+    assert by_id[("t0", 1)].hu_mean == 40
+    assert by_id[("t1", 1)].hu_mean == 80
+    assert by_id[("t0", 1)].volume_cm3 == pytest.approx(64 / 1000)
+
+
+def test_tracking_reports_each_date_before_the_result_is_written():
+    shape = (8, 8, 16)
+    organs = _liver(shape)
+    lesion = _box(shape, (2, 2, 4), (3, 3, 3))
+    notes = []
+    track([
+        _exam("1999-04-30", organs, lesion),
+        _exam("1999-06-01", organs, lesion),
+    ], registrar=_Identity(), min_voxels=4, dilation_mm=0, report=lambda percent, detail: notes.append((percent, detail)))
+    assert [percent for percent, _detail in notes] == [8, 49, 92]
+    assert "1999-04-30" in notes[0][1]
+    assert "1999-06-01" in notes[1][1]
+    assert notes[1][1].startswith("Recalage du foie")
+
+
+def test_a_lesion_can_leave_and_come_back_with_the_same_number():
+    shape = (4, 4, 56)
+    organs = _liver(shape)
+    first = _box(shape, (1, 1, 4), (2, 2, 2))
+    second = _box(shape, (1, 1, 23), (2, 2, 2))
+    third = _box(shape, (1, 1, 42), (2, 2, 2))
+    grown = _box(shape, (0, 0, 2), (4, 4, 6))
+    exams = [
+        _exam("t0", organs, first),
+        _exam("t1", organs, second),
+        _exam("t2", organs, third),
+        _exam("t3", organs, np.zeros(shape)),
+        _exam("t4", organs, grown),
+    ]
+    result = track(exams, registrar=_Identity(), min_voxels=4, dilation_mm=0)
+    assert [row.status for row in result.records if row.lesion_id == 1] == [NOUVELLE, STABLE, STABLE, DISPARUE, PROGRESSION]
+    assert set(np.unique(result.labels["t4"])) == {0, 1}
+
+
+def test_couinaud_is_the_majority_segment_and_the_largest_lesion_is_first():
+    shape = (6, 6, 12)
+    organs = _liver(shape)
+    small = _box(shape, (1, 1, 1), (2, 2, 2))
+    large = _box(shape, (1, 1, 6), (3, 3, 3))
+    segments = np.zeros(shape, np.int32)
+    segments[large > 0] = 6
+    segments[1, 1, 6] = 4
+    result = track([_exam("t0", organs, small + large, segments=segments)], registrar=_Identity(), min_voxels=4, dilation_mm=0)
+    assert np.array_equal(result.labels["t0"] == 1, large.astype(bool))
+    rows = {row.lesion_id: row for row in result.records}
+    assert rows[1].couinaud == 6
+    assert rows[2].couinaud is None
+
+
+def test_folder_roundtrip_rejects_a_mask_on_another_grid(tmp_path):
+    patient = tmp_path / "HCC_001"
+    shape = (6, 6, 8)
+    organs = _liver(shape)
+    lesions = _box(shape, (2, 2, 2), (2, 2, 2))
+    ct = np.full(shape, 30, np.float32)
+    for name in ("2000-01-01", "2000-06-01"):
+        _write_exam(patient / name, ct, organs, lesions)
+    result = track_folder(patient, tmp_path / "out", registrar=_Identity(), min_voxels=4, dilation_mm=0)
+    stored = sitk.GetArrayFromImage(sitk.ReadImage(str(tmp_path / "out" / "2000-06-01.nii.gz")))
+    assert np.array_equal(stored, result.labels["2000-06-01"])
+    payload = json.loads((tmp_path / "out" / "tracking.json").read_text(encoding="utf-8"))
+    assert payload["baseline"] == "2000-01-01"
+    assert payload["lesions"][1]["status"] == STABLE
+    foreign = patient / "2000-06-01" / "lesions.nii.gz"
+    image = sitk.ReadImage(str(foreign))
+    image.SetSpacing((2.0, 2.0, 2.0))
+    sitk.WriteImage(image, str(foreign), True)
+    with pytest.raises(LesionTrackingError, match="grille"):
+        load_exam(patient / "2000-06-01")
+
+
+def test_registration_brings_a_shifted_liver_lesion_back():
+    shape = (16, 16, 32)
+    fixed_liver = _ball(shape, (8, 8, 10), 5)
+    moving_liver = _ball(shape, (8, 8, 15), 5)
+    organs_fixed = np.where(fixed_liver, 5, 0).astype(np.int32)
+    organs_moving = np.where(moving_liver, 5, 0).astype(np.int32)
+    fixed_lesion = _box(shape, (7, 7, 9), (3, 3, 3))
+    moving_lesion = _box(shape, (7, 7, 14), (3, 3, 3))
+    fixed = _exam("t0", organs_fixed, fixed_lesion)
+    moving = _exam("t1", organs_moving, moving_lesion)
+    assert dice(fixed_lesion, moving_lesion) == 0
+    warped = SimpleItkAnatomyRegistrar(affine_iterations=60, demons_iterations=15).warp_labels(fixed, moving, moving_lesion.astype(np.uint16))
+    assert dice(warped > 0, fixed_lesion > 0) > 0
+    result = track([fixed, moving], registrar=SimpleItkAnatomyRegistrar(affine_iterations=60, demons_iterations=15), min_voxels=4, dilation_mm=0)
+    assert set(np.unique(result.labels["t1"])) == {0, 1}
+    assert result.records[-1].status != NOUVELLE
+
+
+def test_a_missing_liver_and_an_unknown_backend_are_rejected():
+    organs = np.zeros((4, 4, 4), np.int32)
+    with pytest.raises(LesionTrackingError, match="foie"):
+        track([_exam("t0", organs, organs)], registrar=_Identity())
+    with pytest.raises(LesionTrackingError, match="sitk ou ants"):
+        make_registrar("elastix")
+
+
+def test_ants_reports_a_missing_install():
+    organs = _liver((4, 4, 4))
+    lesions = _box((4, 4, 4), (1, 1, 1), (2, 2, 2))
+    try:
+        import ants  # noqa: F401
+    except ImportError:
+        with pytest.raises(LesionTrackingError, match="antspyx"):
+            make_registrar("ants").warp_labels(_exam("t0", organs, lesions), _exam("t1", organs, lesions), lesions.astype(np.uint16))
+    else:
+        pytest.skip("antspyx est installé")
+
+
+def _ball(shape, center, radius):
+    zz, yy, xx = np.ogrid[0:shape[0], 0:shape[1], 0:shape[2]]
+    return (zz - center[0]) ** 2 + (yy - center[1]) ** 2 + (xx - center[2]) ** 2 <= radius ** 2
+
+
+def _write_exam(folder: Path, ct, organs, lesions) -> None:
+    folder.mkdir(parents=True)
+    for name, array in (("image.nii.gz", ct), ("organs.nii.gz", organs), ("lesions.nii.gz", lesions)):
+        image = sitk.GetImageFromArray(np.asarray(array))
+        image.SetSpacing((1.0, 1.2, 1.5))
+        sitk.WriteImage(image, str(folder / name), True)

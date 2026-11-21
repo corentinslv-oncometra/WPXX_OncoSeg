@@ -34,6 +34,13 @@ DOCKER_IMAGE = (
 KERNEL_SCRIPT = Path(__file__).resolve().parent / "kaggle_kernel" / "run.py"
 _TOKEN_RE = re.compile(r"KGAT_[0-9a-fA-F]+")
 _remote_lock = threading.Lock()
+_session_lock = threading.Lock()
+_session_id: int | None = None
+_cancel_unsupported = False
+
+
+class RemoteCancelled(RuntimeError):
+    """The reader stopped the Kaggle job before it finished."""
 
 
 def token_path() -> Path:
@@ -41,8 +48,8 @@ def token_path() -> Path:
 
 
 def prefer_remote_gpu() -> None:
-    """Keep Détecter on the local CPU unless a device was chosen before startup."""
-    os.environ.setdefault("ONCOMETRA_TOTALSEG_DEVICE", "cpu")
+    """Send Détecter to a Kaggle GPU unless a device was chosen before startup."""
+    os.environ.setdefault("ONCOMETRA_TOTALSEG_DEVICE", "kaggle")
 
 
 def stage_exam(root: Path, username: str, image: Path, uid: str, lesion_task: str | None, *,
@@ -149,7 +156,7 @@ def place_outputs(download_root: Path, uid: str, dest: Path, *, need_organs: boo
         shutil.copy2(gpu_log, dest / "nvidia-smi.csv")
 
 
-def ensure_remote_masks(image: Path, uid: str, lesion_task: str | None, dest: Path, report=None) -> None:
+def ensure_remote_masks(image: Path, uid: str, lesion_task: str | None, dest: Path, report=None, stop=None) -> None:
     """Run the missing organ and lesion tasks on Kaggle, then copy the NIfTI masks."""
     from app.services.exam_autoseg import discard_foreign_mask
     discard_foreign_mask(image, dest / "organs.nii.gz")
@@ -171,15 +178,16 @@ def ensure_remote_masks(image: Path, uid: str, lesion_task: str | None, dest: Pa
             dataset, kernel = stage_exam(root, username, image, uid, lesion_task, organs=need_organs, lesions=need_lesions)
             ref = f"{username}/{DATASET_SLUG}"
             tell("Envoi du volume vers un dataset privé…")
-            _publish_dataset(api, dataset, ref)
+            _publish_dataset(api, dataset, ref, stop)
             source = f"{ref}/{_dataset_version(api, ref)}"
             metadata = json.loads((kernel / "kernel-metadata.json").read_text(encoding="utf-8"))
             metadata["dataset_sources"] = [source]
             _write_json(kernel / "kernel-metadata.json", metadata)
             tell("Démarrage du notebook GPU…")
             kernel_ref = f"{username}/{KERNEL_SLUG}"
-            _push_kernel(api, kernel, kernel_ref, source)
-            _wait_kernel(api, kernel_ref, tell)
+            _push_kernel(api, kernel, kernel_ref, source, stop)
+            _wait_kernel(api, kernel_ref, tell, stop)
+            _raise_if_stopped(stop)
             tell("Récupération des masques…")
             download.mkdir(parents=True, exist_ok=True)
             api.kernels_output(kernel_ref, str(download), force=True, quiet=True)
@@ -276,7 +284,7 @@ def _client():
     return api
 
 
-def _publish_dataset(api, folder: Path, ref: str) -> None:
+def _publish_dataset(api, folder: Path, ref: str, stop=None) -> None:
     try:
         if _dataset_exists(api, ref):
             api.dataset_create_version(str(folder), "Refresh the exam volume", quiet=True,
@@ -289,7 +297,7 @@ def _publish_dataset(api, folder: Path, ref: str) -> None:
                                        convert_to_csv=False, delete_old_versions=False)
         else:
             raise
-    _wait_dataset(api, ref)
+    _wait_dataset(api, ref, stop)
 
 
 def _dataset_exists(api, ref: str) -> bool:
@@ -307,9 +315,10 @@ def _dataset_exists(api, ref: str) -> bool:
         raise
 
 
-def _wait_dataset(api, ref: str) -> None:
+def _wait_dataset(api, ref: str, stop=None) -> None:
     deadline = time.time() + 30 * 60
     while True:
+        _raise_if_stopped(stop)
         status = str(api.dataset_status(ref)).lower()
         if "error" in status or "fail" in status:
             raise RuntimeError(f"Kaggle n’a pas accepté le volume ({_redact(status)}).")
@@ -317,7 +326,7 @@ def _wait_dataset(api, ref: str) -> None:
             return
         if time.time() > deadline:
             raise RuntimeError("Kaggle n’a pas fini de préparer le volume.")
-        time.sleep(10)
+        _pause(stop, 10)
 
 
 def _dataset_version(api, ref: str) -> str:
@@ -337,7 +346,7 @@ def _dataset_has_job(api, ref: str) -> bool:
     return any(getattr(item, "name", "") == "job.json" for item in files)
 
 
-def _push_kernel(api, folder: Path, kernel_ref: str, dataset_ref: str) -> None:
+def _push_kernel(api, folder: Path, kernel_ref: str, dataset_ref: str, stop=None) -> None:
     """Save, prove the new version kept the dataset, then start that notebook.
 
     A push made the instant a new dataset version becomes ready is stored with
@@ -359,11 +368,12 @@ def _push_kernel(api, folder: Path, kernel_ref: str, dataset_ref: str) -> None:
             if invalid:
                 last = ", ".join(invalid)
             elif _version_has_dataset(api, kernel_ref, running, dataset_ref):
+                _remember_session(getattr(running, "version_number", None) or getattr(running, "versionNumber", None))
                 return
             else:
                 last = "source absente au démarrage"
         if attempt < 3:
-            time.sleep(20)
+            _pause(stop, 20)
     raise RuntimeError(f"Kaggle n’a pas attaché le volume privé ({_redact(last)}).")
 
 
@@ -391,9 +401,10 @@ def _saved_dataset_sources(api, ref: str) -> list[str]:
         shutil.rmtree(folder, ignore_errors=True)
 
 
-def _wait_kernel(api, ref: str, tell) -> None:
+def _wait_kernel(api, ref: str, tell, stop=None) -> None:
     deadline = time.time() + _kernel_timeout()
     while True:
+        _raise_if_stopped(stop)
         state, detail = _kernel_state(api.kernels_status(ref))
         tell(f"GPU Kaggle : {detail or state}")
         if state == "complete":
@@ -402,7 +413,93 @@ def _wait_kernel(api, ref: str, tell) -> None:
             raise RuntimeError(_kernel_failure(api, ref, detail))
         if time.time() > deadline:
             raise RuntimeError("Le notebook GPU a dépassé le temps prévu.")
-        time.sleep(20)
+        _pause(stop, 20)
+
+
+def cancel_remote_session() -> None:
+    """Ask Kaggle to drop the notebook this detection started.
+
+    A missing id is ignored. An API token without kernelSessions.cancel is remembered
+    so later clicks do not repeat the same refusal.
+    """
+    global _cancel_unsupported
+    if _cancel_unsupported:
+        return
+    session_id = _current_session_id()
+    if not session_id:
+        return
+    api = _client()
+    from kagglesdk.kernels.types.kernels_api_service import ApiCancelKernelSessionRequest
+    request = ApiCancelKernelSessionRequest()
+    request.kernel_session_id = int(session_id)
+    try:
+        with api.build_kaggle_client() as client:
+            response = client.kernels.kernels_api_client.cancel_kernel_session(request)
+    except Exception as error:
+        if _cancel_permission_denied(error):
+            _cancel_unsupported = True
+            logger.warning("Kaggle refused to cancel the notebook: this token lacks kernelSessions.cancel. The local wait is stopped.")
+            return
+        raise
+    message = str(getattr(response, "error_message", "") or getattr(response, "errorMessage", "") or "").strip()
+    if message:
+        raise RuntimeError(_redact(message))
+
+
+def _cancel_permission_denied(error: Exception) -> bool:
+    response = getattr(error, "response", None)
+    if getattr(response, "status_code", None) != 403:
+        return False
+    body = str(getattr(response, "text", "") or error)
+    return "kernelSessions.cancel" in body or "PERMISSION_DENIED" in body
+
+
+def _remember_session(version) -> None:
+    global _session_id
+    try:
+        number = int(version)
+    except (TypeError, ValueError):
+        return
+    if number <= 0:
+        return
+    with _session_lock:
+        _session_id = number
+
+
+def _current_session_id() -> int | None:
+    with _session_lock:
+        if _session_id:
+            return _session_id
+    try:
+        api = _client()
+        username = str(api.config_values["username"])
+        with api.build_kaggle_client() as client:
+            response = client.http_client()._session.get(
+                "https://www.kaggle.com/api/v1/kernels/pull",
+                params={"userName": username, "kernelSlug": KERNEL_SLUG},
+                timeout=30,
+            )
+            response.raise_for_status()
+            number = (response.json().get("metadata") or {}).get("currentVersionNumber")
+        _remember_session(number)
+    except Exception:
+        logger.exception("Kaggle session id was not available")
+        return None
+    with _session_lock:
+        return _session_id
+
+
+def _raise_if_stopped(stop) -> None:
+    if stop is not None and stop.is_set():
+        raise RemoteCancelled("Détection annulée.")
+
+
+def _pause(stop, seconds: float) -> None:
+    if stop is None:
+        time.sleep(seconds)
+        return
+    if stop.wait(seconds):
+        raise RemoteCancelled("Détection annulée.")
 
 
 def _kernel_failure(api, ref: str, detail: str) -> str:

@@ -3,6 +3,7 @@ import {PLANE_AXES, zoomTransform, wheelPixels, nextFocus, isTextEditing, UndoQu
 import {workflowState, STATUS_LABELS} from '/annotation-workflow.mjs?v=nodules-1';
 import {jobNoduleLabel, selectedNodule, proposalIsCurrent, previewLabel} from '/nodule-controls.mjs?v=nodules-1';
 import {DIAMETER_PRESETS, createEditSettings, normalizeDiameter, strokeSpec, sphereSectionRadius} from '/mask-editing.mjs?v=mask-tools-1';
+import {createLongitudinal} from '/assets/longitudinal.mjs?v=follow-4';
 
 const $ = (id) => document.getElementById(id);
 const embedded = new URLSearchParams(location.search).get('embedded') === '1';
@@ -29,7 +30,8 @@ const state = {page: "cases", cases: [], id: null, meta: null, volume: null, mas
   window: {width: 1500, level: -600}, epoch: 0, activePlane: "axial", focusedPlane: null,
   editSettings: createEditSettings(), brushHover: null, identity: null,
   selectedNodule: null, jobs: [], runningJobId: null, noduleBoxes: {}, noduleColors: {},
-  hiddenNodules: new Set(), displayVersion: 0, organs: null, organColors: {}, organNames: {}, soloOrgan: null, organVisible: true};
+  hiddenNodules: new Set(), displayVersion: 0, organs: null, organColors: {}, organNames: {}, soloOrgan: null, organVisible: true,
+  segmentationFile: false};
 let identityId = 'reviewer';
 try {identityId = localStorage.getItem('lung-test-identity') || identityId;} catch {}
 const views = [...document.querySelectorAll(".viewport")].map((node) => ({
@@ -138,7 +140,7 @@ async function openCase(id) {
   await flushPendingPoint();
   undoQueue.clear();
   const epoch = ++state.epoch; state.loading = true; clearTimeout(pollTimer);
-  state.id = id; state.meta = null; state.volume = null; state.mask = null; state.proposal = null;
+  state.id = id; state.meta = null; state.segmentationFile = false; state.volume = null; state.mask = null; state.proposal = null;
   state.preview = false; state.box = null; state.job = null; state.undo = []; state.brushHover = null;
   state.jobs = []; state.runningJobId = null; state.selectedNodule = null;
   state.organs = null; state.organColors = {}; state.organNames = {}; state.soloOrgan = null;
@@ -157,7 +159,7 @@ async function openCase(id) {
       catch (error) {if (error.status !== 409) throw error;}
       meta = await json(base());
     }
-    state.meta = meta; state.volume = volume; state.jobs = meta.jobs;
+    state.meta = meta; state.volume = volume; state.jobs = meta.jobs; syncSegmentation();
     syncCaseStatus();
     state.cross = meta.size_xyz.map((n) => Math.floor(n / 2));
     await loadMask();
@@ -246,7 +248,9 @@ function updateOrganBox() {
       const row = (z * ySize + y) * xSize;
       for (let x = 0; x < xSize; x++) {
         const index = row + x;
-        if (!(organs[index] === 65000 || (mask && lesions.has(mask[index])))) continue;
+        const aiHere = state.organVisible && organs[index] === 65000;
+        const segHere = state.segmentationFile && state.overlay && mask && lesions.has(mask[index]);
+        if (!(aiHere || segHere)) continue;
         if ((seen++ % 4) !== 0) continue;
         const here = organs[index];
         if (here && here !== 65000) votes.set(here, (votes.get(here) || 0) + 4);
@@ -273,7 +277,7 @@ function isRecordedTumor(nodule) {
 function updateCompareHint() {
   const hint = $("compare-hint");
   if (!hint) return;
-  const hasSegment = (state.meta?.nodules || []).some(isRecordedTumor);
+  const hasSegment = state.segmentationFile && (state.meta?.nodules || []).some(isRecordedTumor);
   hint.hidden = !(hasSegment && state.organNames[65000]);
 }
 function updateTumorMarks() {
@@ -288,7 +292,9 @@ function updateTumorMarks() {
       const row = (z * ySize + y) * xSize;
       for (let x = 0; x < xSize; x++) {
         const index = row + x;
-        if (!((organs && organs[index] === 65000) || (mask && tumorLabels.has(mask[index])))) continue;
+        const aiHere = state.organVisible && organs && organs[index] === 65000;
+        const segHere = state.segmentationFile && state.overlay && mask && tumorLabels.has(mask[index]);
+        if (!(aiHere || segHere)) continue;
         sagittal[x] = 1; coronal[y] = 1; axial[z] = 1;
       }
     }
@@ -357,6 +363,7 @@ async function loadMask() {
 async function reloadDraft() {
   state.meta = await json(base());
   state.jobs = state.meta.jobs;
+  syncSegmentation();
   await loadMask(); reconcileNodules(); syncCaseStatus(); renderHistory(); updateControls(); requestRender();
 }
 function syncCaseStatus() {
@@ -469,10 +476,32 @@ function displaySigns(plane) {
 }
 function offset(x, y, z) { return (z * state.meta.size_xyz[1] + y) * state.meta.size_xyz[0] + x; }
 function point3(plane, u, v) { const result = [...state.cross]; const [a, b] = axes(plane); result[a] = u; result[b] = v; return result; }
+const longitudinal = createLongitudinal({
+  view: $('longitudinal-view'),
+  inspector: $('follow-inspector'),
+  windowing: () => state.window,
+  loadVolume: async (studyId) => {
+    const meta = await json(`/api/lung/studies/${studyId}`);
+    const response = await api(`/api/lung/studies/${studyId}/volume`);
+    const volume = new Float32Array(await response.arrayBuffer());
+    if (volume.length !== meta.size_xyz.reduce((a, b) => a * b, 1)) throw new Error('Volume de suivi illisible.');
+    return {meta, volume};
+  },
+  loadLabels: async (timeId) => new Uint16Array(await (await api(`/api/studies/${state.id}/longitudinal/labels?time=${encodeURIComponent(timeId)}`)).arrayBuffer()),
+  onChange: (active) => {
+    document.body.classList.toggle('longitudinal-mode', active);
+    if (embedded) parent.postMessage({type: 'oncometra:longitudinal-state', active}, location.origin);
+  },
+});
 function requestRender() {
   if (renderPending) return;
   renderPending = true;
-  requestAnimationFrame(() => { renderPending = false; if (state.page === "annotate") views.forEach(renderView); });
+  requestAnimationFrame(() => {
+    renderPending = false;
+    if (state.page !== 'annotate') return;
+    if (longitudinal.active()) longitudinal.redraw();
+    else views.forEach(renderView);
+  });
 }
 function orientation(axis, sign) {
   const d = state.meta.direction;
@@ -513,7 +542,7 @@ function renderView(view) {
   const outlineOrgan = state.organBox?.label || 0;
   const rasterKey = [state.volume, state.mask, overlay, opacity, low, state.window.width, slice,
     state.preview, targetLabel, state.selectedNodule, state.displayVersion, signX, signY,
-    state.organs, state.soloOrgan, state.organVisible, outlineOrgan];
+    state.organs, state.soloOrgan, state.organVisible, state.segmentationFile, outlineOrgan];
   // Zoom, pan and crosshair changes reuse the raster instead of windowing every voxel again.
   if (!view.rasterKey || rasterKey.some((value, i) => value !== view.rasterKey[i])) {
     source.width = width; source.height = height;
@@ -530,14 +559,15 @@ function renderView(view) {
       const value = Math.max(0, Math.min(255, (state.volume[index] - low) * 255 / state.window.width));
       const label = previewLabel(state.mask?.[index] || 0, state.preview && overlay?.[index], targetLabel);
       const color = tumorLabels.has(label) ? tumorRed : (colors[label] || [104, 237, 182]);
-      const showMask = Boolean(label) && !state.hiddenNodules.has(label) && opacity > 0;
       const organ = state.organs ? state.organs[index] : 0;
       const organIsTumor = organ === 65000;
-      const showOrgan = state.organVisible && organ && (!state.soloOrgan || organ === state.soloOrgan);
-      const aiHere = Boolean(showOrgan && organIsTumor);
+      const showOrgan = state.organVisible && organ && !organIsTumor && (!state.soloOrgan || organ === state.soloOrgan);
+      const showAi = state.organVisible && organIsTumor && (!state.soloOrgan || state.soloOrgan === 65000);
+      const showSeg = Boolean(state.segmentationFile && state.overlay && label && !state.hiddenNodules.has(label) && opacity > 0);
       let lesionColor = null;
-      if (aiHere) lesionColor = aiCyan;
-      else if (showMask) lesionColor = color;
+      if (showAi && showSeg) lesionColor = aiCyan.map((channel, i) => Math.round((channel + color[i]) / 2));
+      else if (showAi) lesionColor = aiCyan;
+      else if (showSeg) lesionColor = color;
       let red = value, green = value, blue = value;
       const organColor = showOrgan && !organIsTumor ? state.organColors[organ] : null;
       const organAlpha = organColor ? (state.soloOrgan ? .62 : .42) : 0;
@@ -549,7 +579,7 @@ function renderView(view) {
       pixels.data[p] = red; pixels.data[p + 1] = green; pixels.data[p + 2] = blue;
       pixels.data[p + 3] = 255;
       if (lesionColor) {
-        const cover = showMask ? opacity : 1;
+        const cover = showSeg && !showAi ? opacity : 1;
         lesionPixels.data[p] = lesionColor[0];
         lesionPixels.data[p + 1] = lesionColor[1];
         lesionPixels.data[p + 2] = lesionColor[2];
@@ -987,7 +1017,7 @@ async function changeReview(action, payload = {version: state.meta?.version}) {
   try {
     await post(`${base()}/${action}`, payload);
     state.meta = await json(base()); state.preview = false;
-    state.jobs = state.meta.jobs; reconcileNodules();
+    state.jobs = state.meta.jobs; syncSegmentation(); reconcileNodules();
     if (action !== "reopen") setTool("crosshair");
     syncCaseStatus(); renderHistory();
     if (embedded) parent.postMessage({type: 'oncometra:annotation-updated', studyId: state.id}, location.origin);
@@ -1003,6 +1033,14 @@ $("reset-view").addEventListener("click", () => {views.forEach((v) => {v.zoom = 
 $("toggle-mpr").addEventListener("click", () => focusView(state.focusedPlane ? null : state.activePlane));
 $("zoom-in").addEventListener("click", () => zoomView(views.find((v) => v.plane === state.activePlane), 1.25));
 $("zoom-out").addEventListener("click", () => zoomView(views.find((v) => v.plane === state.activePlane), 1 / 1.25));
+function syncSegmentation() {
+  state.segmentationFile = Boolean(state.meta?.segmentation_file);
+  const button = $("toggle-overlay");
+  if (!button) return;
+  button.title = state.segmentationFile
+    ? "Affiche uniquement le fichier de segmentation déjà présent."
+    : "Aucun fichier de segmentation pour cet examen.";
+}
 function toggleOverlay() {state.overlay = !state.overlay; $("toggle-overlay").classList.toggle("active", state.overlay); requestRender();}
 $("toggle-overlay").addEventListener("click", toggleOverlay);
 function toggleOrgans() {state.organVisible = !state.organVisible; $("toggle-organs").classList.toggle("active", state.organVisible); if (!state.organVisible) {state.soloOrgan = null; const chip = $("organ-hold"); if (chip) chip.hidden = true;} requestRender();}
@@ -1197,14 +1235,16 @@ $("test-identity").addEventListener('change', task(async () => {
   } finally {state.busy = false; updateControls();}
 }));
 window.addEventListener("message", (event) => {
-  if (event.origin !== location.origin || event.data?.type !== "oncometra:load-organs") return;
+  if (event.origin !== location.origin) return;
+  if (event.data?.type === "oncometra:load-organs") {
+    task(async () => { await loadOrgans(); })();
+    return;
+  }
+  if (event.data?.type !== "oncometra:longitudinal") return;
   task(async () => {
-    if (event.data.seeded) {
-      await reloadDraft();
-      const detected = (state.meta?.nodules || []).find((nodule) => nodule.name === "AI lesion detection");
-      if (detected) selectNodule(detected.label);
-    }
-    await loadOrgans();
+    if (!event.data.enter) { longitudinal.exit(); return; }
+    try { await longitudinal.enter(event.data.bundle); }
+    catch (error) { longitudinal.exit(); throw error; }
   })();
 });
 task(init)();

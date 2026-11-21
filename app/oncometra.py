@@ -194,7 +194,7 @@ def image_directory(case):
 
 
 def _seed_tumor_overlay(db, study_id, reference: Path, user):
-    """Show the DICOM SEG tumor in red until the reader edits the mask."""
+    """Show the DICOM SEG tumor in the mask layer. An AI lesion is never copied here."""
     from app.services.nodules import new_nodule
     if not reference.is_file():
         return
@@ -725,7 +725,8 @@ def open_local_exam(project_id: str, req: LocalExam, user=Depends(current_user))
         case = db.get(WorkspaceCase, case_id)
         account = db.get(WorkspaceUser, user.id)
         assignment = create_assignment(db, case, account)
-        _seed_tumor_overlay(db, assignment.study_id, image_directory(case) / "reference.nii.gz", account)
+        if (case.source or {}).get("tumor_from_seg"):
+            _seed_tumor_overlay(db, assignment.study_id, image_directory(case) / "reference.nii.gz", account)
         audit(db, account, "local_exam_opened", assignment.study_id, {"patient": req.patient_id, "timepoint": req.timepoint_id})
         db.commit()
         return {"study_id": assignment.study_id, **position}
@@ -768,16 +769,29 @@ def study_organs(study_id: UUID, user=Depends(current_user)):
     return payload
 
 
+class DetectionStart(BaseModel):
+    device: str = ""
+
+
 @app.post("/api/studies/{study_id}/autoseg", status_code=202)
-def start_study_autoseg(study_id: UUID, user=Depends(current_user)):
+def start_study_autoseg(study_id: UUID, body: DetectionStart | None = None, user=Depends(current_user)):
     from app.services.exam_autoseg import start_detection
     with SessionLocal() as db:
         _, case = get_assignment(db, study_id, user)
         case_id = case.id
     try:
-        return start_detection(case_id, str(study_id))
+        return start_detection(case_id, str(study_id), (body.device if body else "") or None)
     except RuntimeError as error:
-        raise HTTPException(409, str(error)) from error
+        status = 422 if "inconnu" in str(error) else 409
+        raise HTTPException(status, str(error)) from error
+
+
+@app.post("/api/studies/{study_id}/autoseg/cancel")
+def cancel_study_autoseg(study_id: UUID, user=Depends(current_user)):
+    from app.services.exam_autoseg import cancel_detection
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        return cancel_detection(case.id)
 
 
 @app.get("/api/studies/{study_id}/autoseg")
@@ -786,6 +800,58 @@ def study_autoseg_status(study_id: UUID, user=Depends(current_user)):
     with SessionLocal() as db:
         _, case = get_assignment(db, study_id, user)
         return detection_status(case.id)
+
+
+@app.post("/api/studies/{study_id}/lesion-tracking", status_code=202)
+def start_study_followup(study_id: UUID, user=Depends(current_user)):
+    from app.services.lesion_followup import start_followup
+    from app.services.lesion_tracking import LesionTrackingError
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        case_id = case.id
+    try:
+        return start_followup(case_id)
+    except LesionTrackingError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.get("/api/studies/{study_id}/lesion-tracking")
+def study_followup_status(study_id: UUID, user=Depends(current_user)):
+    from app.services.lesion_followup import followup_status
+    from app.services.lesion_tracking import LesionTrackingError
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        case_id = case.id
+    try:
+        return followup_status(case_id)
+    except LesionTrackingError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@app.get("/api/studies/{study_id}/longitudinal")
+def study_longitudinal(study_id: UUID, user=Depends(current_user)):
+    from app.services.longitudinal import LongitudinalError, longitudinal_bundle
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        case_id = case.id
+    try:
+        return longitudinal_bundle(case_id, user.id)
+    except LongitudinalError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@app.get("/api/studies/{study_id}/longitudinal/labels")
+def study_longitudinal_labels(study_id: UUID, time: str, user=Depends(current_user)):
+    from app.services.longitudinal import LongitudinalError, label_volume
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        case_id = case.id
+    try:
+        labels = label_volume(case_id, time)
+    except LongitudinalError as error:
+        raise HTTPException(404, str(error)) from error
+    return Response(content=gzip.compress(labels.tobytes(), compresslevel=1), media_type="application/octet-stream",
+                    headers={"Content-Encoding": "gzip", "Cache-Control": "no-store"})
 
 
 @app.get("/api/studies/{study_id}/organ-overlay")
@@ -1177,7 +1243,7 @@ app.mount("/assets", StaticFiles(directory=ROOT / "app/static"), name="assets")
 
 @app.get("/{filename}")
 def viewer_asset(filename: str):
-    if filename not in {"annotate.css", "annotate.js", "import-files.mjs", "viewer-controls.mjs", "annotation-workflow.mjs", "nodule-controls.mjs", "mask-editing.mjs"}:
+    if filename not in {"annotate.css", "annotate.js", "import-files.mjs", "viewer-controls.mjs", "annotation-workflow.mjs", "nodule-controls.mjs", "mask-editing.mjs", "longitudinal.mjs"}:
         raise HTTPException(404, "Not found")
     return FileResponse(ROOT / "app/static" / filename)
 

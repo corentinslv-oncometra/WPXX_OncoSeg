@@ -266,7 +266,12 @@ def annotation_state(study_id: UUID, db: Session = Depends(get_db)):
     status = task_status(head, events[0] if events else None, confirmation)
     nodules = nodules_for(db, head)
     current_revision = db.get(AnnotationRevision, head.revision_id) if head.revision_id else None
+    from app.oncometra_models import WorkspaceAssignment, WorkspaceCase
+    assignment = db.get(WorkspaceAssignment, str(study_id))
+    case = db.get(WorkspaceCase, assignment.case_id) if assignment else None
+    segmentation_file = bool((case.source or {}).get("tumor_from_seg")) if case else False
     return {"study_id": str(study_id), "version": head.version, "revision_id": head.revision_id,
+            "segmentation_file": segmentation_file,
             "nodules": nodules, "mask_encoding": "uint8-nodule-labels",
             "can_add_nodule": (current_revision.details.get("max_nodule_label", 1) if current_revision else 1) < MAX_NODULE_LABEL,
             "annotation_status": status, "identity": actor_for(db), "permissions": task_permissions(db, status),

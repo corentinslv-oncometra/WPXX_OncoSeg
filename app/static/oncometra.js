@@ -6,6 +6,8 @@ const statusName = value => ({new:'À annoter', in_progress:'Annotation en cours
 const badge = value => `<span class="status ${escape(value)}">${escape(statusName(value))}</span>`;
 const state = {user:null, data:null, tab:'datasets', project:'', query:'', status:'', assignment:null, jobs:[], users:[], browse:null, ai:{}, aiTimer:0};
 let toastTimer;
+let detectionRunning=false;
+let trackingRunning=false;
 async function api(path, data, method) {
   const options = {method:method || (data ? 'POST':'GET'), credentials:'same-origin', headers:{}};
   if (data instanceof FormData) options.body = data;
@@ -29,7 +31,7 @@ function pendingCount(){
   return state.data.cases.filter(item=>ids.has(item.project_id) && !state.data.assignments.some(row=>row.case_id===item.id && row.status==='approved')).length;
 }
 async function refresh(render=true){state.data=await api('/api/workspace');$('work-count').textContent=pendingCount();$('storage-status').textContent=state.data.storage==='ephemeral'?'Stockage temporaire':'Stockage local';if(render && state.tab!=='annotation') await showTab(state.tab);}
-async function showTab(tab){state.tab=tab;const selected=tab==='annotation'?'review':tab;document.querySelectorAll('[data-tab]').forEach(button=>button.classList.toggle('selected',button.dataset.tab===selected));$('annotation-page').hidden=tab!=='annotation';$('content').hidden=tab==='annotation';if(tab!=='annotation') hideDetection();if(tab==='annotation')return;const renders={datasets:platform.renderDatasets,cohorts:renderCohorts,review:renderReview,admin:renderAdmin};await renders[tab]();}
+async function showTab(tab){state.tab=tab;const selected=tab==='annotation'?'review':tab;document.querySelectorAll('[data-tab]').forEach(button=>button.classList.toggle('selected',button.dataset.tab===selected));$('annotation-page').hidden=tab!=='annotation';$('content').hidden=tab==='annotation';if(tab!=='annotation'){hideDetection();hideTracking();exitFollowMode();}if(tab==='annotation')return;const renders={datasets:platform.renderDatasets,cohorts:renderCohorts,review:renderReview,admin:renderAdmin};await renders[tab]();}
 
 function cohortStatus(project){
   if(!project.cases) return {id:'failed', label:'Images non importées'};
@@ -267,6 +269,9 @@ async function openAssignment(id){
   }
   $('viewer').src=`/viewer?study_id=${id}&embedded=1`;await showTab('annotation');
   renderBrowseNav();
+  followStored=false;
+  setTrackLabel();
+  rememberStoredTracking(id);
   watchDetection(id);
 }
 async function renderAdmin(){
@@ -363,6 +368,11 @@ $('refresh-assignment').onclick=action(async()=>{await refresh(false);await open
 function huText(value){return Number(value).toLocaleString('fr-FR',{maximumFractionDigits:1});}
 let detectionTimer=0;
 let detectionSeen='';
+let trackingTimer=0;
+let trackingSeen='';
+let trackingDismissed=false;
+let longitudinalActive=false;
+let followStored=false;
 let detectionClock=null;
 let detectionTick=0;
 let detectionDismissed=false;
@@ -391,7 +401,8 @@ function paintDetectionClock(){
 }
 function renderDetection(status){
   const running=status.state==='running';
-  $('detection-title').textContent=running?'Détection en cours':status.state==='error'?'Détection interrompue':'Détection terminée';
+  const titles={running:'Détection en cours',error:'Détection interrompue',cancelled:'Détection annulée',done:'Détection terminée'};
+  $('detection-title').textContent=titles[status.state]||'Détection';
   $('detection-detail').textContent=status.detail||(running?'Préparation de l’examen…':'');
   const known=typeof status.percent==='number';
   const percent=known?Math.max(0,Math.min(100,Math.round(status.percent))):0;
@@ -407,6 +418,8 @@ function renderDetection(status){
     dice.hidden=false;
     dice.textContent=`Score Dice ${status.dice.toLocaleString('fr-FR',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
   }else{dice.hidden=true;dice.textContent='';}
+  const cancel=$('detection-cancel');
+  if(cancel){cancel.hidden=!running;cancel.disabled=false;}
   window.clearInterval(detectionTick);
   if(running) detectionTick=window.setInterval(paintDetectionClock,1000);
 }
@@ -423,11 +436,32 @@ function closeDetection(){
   detectionDismissed=true;
   hideDetection();
 }
-function showDetection(status){
+function detectionButtons(){
+  return ['assignment-detect','assignment-detect-local','assignment-detect-kaggle'].map(id=>$(id)).filter(Boolean);
+}
+function setDetectMenu(open){
+  const panel=$('detect-panel');
   const button=$('assignment-detect');
-  button.disabled=status.state==='running';
-  button.textContent=status.state==='running'?'Détection…':'Détecter';
-  button.title=status.error||status.detail||button.dataset.title||'';
+  if(!panel||!button) return;
+  panel.hidden=!open;
+  button.setAttribute('aria-expanded',open?'true':'false');
+}
+function workBusy(){
+  return detectionRunning||trackingRunning;
+}
+function syncWorkButtons(){
+  const busy=workBusy();
+  for(const button of detectionButtons()) button.disabled=busy;
+  const track=$('assignment-track');
+  if(track) track.disabled=detectionRunning;
+}
+function showDetection(status){
+  detectionRunning=status.state==='running';
+  if(detectionRunning) setDetectMenu(false);
+  for(const button of detectionButtons()){
+    if(button.id!=='assignment-detect') button.title=status.error||status.detail||button.dataset.title||'';
+  }
+  syncWorkButtons();
 }
 async function watchDetection(id){
   window.clearTimeout(detectionTimer);
@@ -441,7 +475,8 @@ async function watchDetection(id){
       if(!detectionDismissed) openDetection(status);
       else if($('detection-dialog').open) renderDetection(status);
     }
-    if((status.state==='done'||status.state==='error')&&$('detection-dialog').open) renderDetection(status);
+    if(['done','error','cancelled'].includes(status.state)&&$('detection-dialog').open) renderDetection(status);
+    if(status.state==='cancelled'&&detectionSeen==='running') toast('Détection annulée.');
     if(status.state==='done'){
       $('viewer').contentWindow?.postMessage({type:'oncometra:load-organs',seeded:!!status.seeded},location.origin);
       if(detectionSeen==='running') toast(status.detail||'Organes affichés. Maintenez 3 secondes sur un organe pour ne garder que lui.');
@@ -449,18 +484,183 @@ async function watchDetection(id){
     if(status.state==='error'&&detectionSeen==='running'&&status.error) toast(status.error,true);
     detectionSeen=status.state;
   }catch(error){
-    if(state.assignment?.id===id) $('assignment-detect').title=error.message;
+    if(state.assignment?.id===id) for(const button of detectionButtons()) button.title=error.message;
   }
 }
-$('assignment-detect').onclick=action(async()=>{
+function startDetection(device){
+  return action(async()=>{
+    if(!state.assignment||workBusy()) return;
+    setDetectMenu(false);
+    const detail=device==='kaggle'?'Préparation de l’envoi vers un GPU Kaggle…':'Préparation de la détection locale…';
+    openDetection({state:'running', detail, percent:1, elapsed_s:0});
+    const status=await api(`/api/studies/${state.assignment.id}/autoseg`,{device});
+    showDetection(status);
+    openDetection(status);
+    watchDetection(state.assignment.id);
+  });
+}
+$('assignment-detect').onclick=()=>{
+  if($('assignment-detect').disabled) return;
+  setDetectMenu($('detect-panel').hidden);
+};
+$('assignment-detect-local').onclick=startDetection('cpu');
+$('assignment-detect-kaggle').onclick=startDetection('kaggle');
+document.addEventListener('click',event=>{
+  const menu=$('detect-menu');
+  if(menu&&!menu.contains(event.target)) setDetectMenu(false);
+});
+let trackingClock=null;
+let trackingTick=0;
+function rememberTrackingClock(status){
+  const frozen=status.state!=='running';
+  if(typeof status.elapsed_s==='number') trackingClock={elapsed:status.elapsed_s, at:performance.now(), frozen};
+  else if(!trackingClock) trackingClock={elapsed:0, at:performance.now(), frozen};
+  else trackingClock.frozen=frozen;
+}
+function paintTrackingClock(){
+  const node=$('tracking-time');
+  if(!node||!trackingClock) return;
+  const seconds=trackingClock.frozen?trackingClock.elapsed:trackingClock.elapsed+(performance.now()-trackingClock.at)/1000;
+  node.textContent=`Temps écoulé ${formatDuration(seconds)}`;
+}
+function renderTracking(status){
+  const running=status.state==='running';
+  const titles={running:'Suivi en cours',error:'Suivi interrompu',done:'Suivi terminé'};
+  $('tracking-title').textContent=titles[status.state]||'Suivi des lésions';
+  $('tracking-detail').textContent=status.detail||(running?'Préparation du suivi…':'');
+  const known=typeof status.percent==='number';
+  const percent=known?Math.max(0,Math.min(100,Math.round(status.percent))):0;
+  $('tracking-percent').textContent=known?`${percent} %`:'Calcul en cours';
+  $('tracking-bar').style.width=known?`${percent}%`:'40%';
+  rememberTrackingClock(status);
+  paintTrackingClock();
+  window.clearInterval(trackingTick);
+  if(running) trackingTick=window.setInterval(paintTrackingClock,1000);
+  const error=$('tracking-error');
+  error.hidden=!status.error;
+  error.textContent=status.error||'';
+  const table=$('tracking-table');
+  const rows=(status.lesions||[]).map(item=>`<tr><td>${escape(item.time_id)}</td><td>${escape(item.lesion_id)}</td><td>${escape(item.status)}</td><td>${item.volume_cm3??'—'}</td><td>${item.long_axis_axial_mm??'—'}</td><td>${item.hu_mean??'—'}</td><td>${item.couinaud??'—'}</td></tr>`).join('');
+  table.hidden=running||!status.lesions;
+  table.innerHTML=rows?`<table><thead><tr><th>Date</th><th>N°</th><th>Statut</th><th>Volume cm³</th><th>Axe axial mm</th><th>UH</th><th>Couinaud</th></tr></thead><tbody>${rows}</tbody></table>`:'';
+  if(!running&&status.lesions&&!rows){
+    table.hidden=false;
+    table.innerHTML='<p>Aucune lésion hépatique sur les examens détectés.</p>';
+  }
+}
+function openTracking(status){
+  trackingRunning=status.state==='running';
+  syncWorkButtons();
+  if(trackingDismissed){
+    if($('tracking-dialog').open) renderTracking(status);
+    return;
+  }
+  if(!$('tracking-dialog').open) $('tracking-dialog').showModal();
+  renderTracking(status);
+}
+function hideTracking(){
+  trackingDismissed=true;
+  window.clearInterval(trackingTick);
+  if($('tracking-dialog').open) $('tracking-dialog').close();
+}
+async function watchTracking(id){
+  window.clearTimeout(trackingTimer);
+  if(!state.assignment||state.assignment.id!==id) return;
+  try{
+    const status=await api(`/api/studies/${id}/lesion-tracking`);
+    if(state.assignment?.id!==id) return;
+    openTracking(status);
+    if(status.state==='running') trackingTimer=window.setTimeout(()=>watchTracking(id),1500);
+    if(status.stored){followStored=true;setTrackLabel();}
+    if(status.state==='done'&&trackingSeen==='running'){
+      followStored=true;
+      setTrackLabel();
+      toast(status.detail||'Suivi terminé.');
+      enterFollowMode().catch(error=>toast(error.message,true));
+    }
+    if(status.state==='error'&&trackingSeen==='running'&&status.error) toast(status.error,true);
+    trackingSeen=status.state;
+  }catch(error){
+    if(state.assignment?.id===id) $('assignment-track').title=error.message;
+  }
+}
+function setTrackLabel(){
+  const button=$('assignment-track');
+  if(!button) return;
+  button.textContent=followStored?'Suivi lésions':'Suivre';
+}
+async function rememberStoredTracking(id){
+  try{
+    const status=await api(`/api/studies/${id}/lesion-tracking`);
+    if(state.assignment?.id!==id) return;
+    followStored=!!status.stored;
+  }catch{
+    if(state.assignment?.id!==id) return;
+    followStored=false;
+  }
+  setTrackLabel();
+}
+function setFollowMode(active){
+  longitudinalActive=active;
+  const button=$('assignment-track');
+  if(!button) return;
+  button.classList.toggle('active',active);
+  button.setAttribute('aria-pressed',active?'true':'false');
+  button.title=active?'Revenir aux vues axiale, coronale et sagittale.':'Affiche le suivi longitudinal des lésions du foie, une date par panneau.';
+  setTrackLabel();
+}
+function exitFollowMode(){
+  if(!longitudinalActive) return;
+  $('viewer').contentWindow?.postMessage({type:'oncometra:longitudinal',enter:false},location.origin);
+  setFollowMode(false);
+}
+async function enterFollowMode(){
   if(!state.assignment) return;
-  openDetection({state:'running', detail:'Préparation de l’examen…', percent:1, elapsed_s:0});
-  const status=await api(`/api/studies/${state.assignment.id}/autoseg`,{});
+  const bundle=await api(`/api/studies/${state.assignment.id}/longitudinal`);
+  const frame=$('viewer').contentWindow;
+  if(!frame) throw new Error('La visionneuse n’est pas ouverte.');
+  frame.postMessage({type:'oncometra:longitudinal',enter:true,bundle},location.origin);
+  followStored=true;
+  setFollowMode(true);
+  hideTracking();
+}
+function startTracking(){
+  return action(async()=>{
+    if(!state.assignment||detectionRunning) return;
+    setDetectMenu(false);
+    if(longitudinalActive){exitFollowMode();return;}
+    trackingDismissed=false;
+    if(trackingRunning){
+      const status=await api(`/api/studies/${state.assignment.id}/lesion-tracking`);
+      openTracking(status);
+      watchTracking(state.assignment.id);
+      return;
+    }
+    try{await enterFollowMode();return;}catch(error){if(!['Aucun suivi enregistré pour ce patient.','Le suivi existe, mais aucun examen n’est ouvert pour l’afficher.','Le suivi enregistré n’a pas de position recalée.'].includes(error.message)) throw error;}
+    openTracking({state:'running',detail:'Préparation du suivi…',percent:4,elapsed_s:0,lesions:[]});
+    try{
+      const status=await api(`/api/studies/${state.assignment.id}/lesion-tracking`,{});
+      openTracking(status);
+      watchTracking(state.assignment.id);
+    }catch(error){
+      trackingRunning=false;
+      syncWorkButtons();
+      hideTracking();
+      throw error;
+    }
+  });
+}
+$('detection-close').onclick=closeDetection;
+$('tracking-close').onclick=hideTracking;
+$('assignment-track').onclick=startTracking();
+$('detection-cancel').onclick=action(async()=>{
+  if(!state.assignment) return;
+  $('detection-cancel').disabled=true;
+  const status=await api(`/api/studies/${state.assignment.id}/autoseg/cancel`,{});
   showDetection(status);
-  openDetection(status);
+  renderDetection(status);
   watchDetection(state.assignment.id);
 });
-$('detection-close').onclick=closeDetection;
 $('assignment-organs').onclick=action(async()=>{
   if(!state.assignment) return;
   const result=await api(`/api/studies/${state.assignment.id}/organs`);
@@ -468,7 +668,14 @@ $('assignment-organs').onclick=action(async()=>{
   showModal('Organes et HU',`<p class="small-note">${escape(result.cancer||'')} · ${escape(result.tumor_note||'Les valeurs sont en unités Hounsfield, calculées dans chaque organe.')}</p><div class="table-scroll organs-table"><table><thead><tr><th>Organe</th><th>Volume</th><th>Moyenne</th><th>Médiane</th><th>Écart-type</th><th>Min</th><th>Max</th><th>P5</th><th>P95</th></tr></thead><tbody>${rows||'<tr><td colspan="9">Aucun organe mesuré.</td></tr>'}</tbody></table></div>`);
 });
 $('assignment-guidelines').onclick=()=>showModal(`Protocole / version ${state.assignment.project_version||'—'}`,`<div class="guideline-copy">${escape(state.assignment.guidelines||'Aucun protocole enregistré pour cette lecture.')}</div>`);
-window.addEventListener('message',action(async event=>{if(event.origin!==location.origin||event.source!==$('viewer').contentWindow||event.data?.type!=='oncometra:annotation-updated')return;await refresh(false);const row=state.data.assignments.find(a=>a.id===event.data.studyId);if(row&&row.id===state.assignment?.id)state.assignment=row;}));
+window.addEventListener('message',action(async event=>{
+  if(event.origin!==location.origin||event.source!==$('viewer').contentWindow) return;
+  if(event.data?.type==='oncometra:longitudinal-state'){setFollowMode(!!event.data.active);return;}
+  if(event.data?.type!=='oncometra:annotation-updated') return;
+  await refresh(false);
+  const row=state.data.assignments.find(a=>a.id===event.data.studyId);
+  if(row&&row.id===state.assignment?.id) state.assignment=row;
+}));
 $('logout').onclick=action(async()=>{await api('/api/auth/logout',{});$('viewer').src='about:blank';showLogin();});
 $('login-form').onsubmit=async event=>{event.preventDefault();$('login-error').textContent='';try{state.user=await api('/api/auth/login',Object.fromEntries(new FormData(event.target)));event.target.reset();await boot();}catch(error){$('login-error').textContent=error.message;}};
 async function boot(){

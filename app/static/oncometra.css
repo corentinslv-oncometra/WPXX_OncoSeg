@@ -79,6 +79,10 @@ dialog:has(.ds-detail){width:min(920px,calc(100vw - 30px))}
 .annotation-identity{grid-area:identity;display:flex;align-items:center;gap:10px;min-width:0}
 #assignment-context{min-width:0;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .annotation-actions{grid-area:actions;display:flex;align-items:center;justify-content:flex-end;gap:8px}
+.detect-menu{position:relative}
+.detect-panel{position:absolute;top:calc(100% + 6px);right:0;z-index:40;display:grid;gap:4px;min-width:196px;padding:6px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 14px 36px rgba(16,24,40,.16)}
+.detect-panel[hidden]{display:none}
+.detect-panel button{width:100%;text-align:left}
 .annotation-context button{white-space:nowrap}
 .browse-nav{grid-area:nav;position:relative;display:flex;justify-content:center;min-width:0}
 .browse-nav[hidden]{display:none}
@@ -104,9 +108,16 @@ dialog:has(.ds-detail){width:min(920px,calc(100vw - 30px))}
 .organs-table th,.organs-table td{white-space:nowrap;text-align:right}
 .organs-table th:first-child,.organs-table td:first-child{text-align:left}
 #detection-dialog{width:min(440px,calc(100vw - 30px))}
+#tracking-dialog{width:min(760px,calc(100vw - 30px))}
+#tracking-detail{margin:0;line-height:1.5}
+#assignment-track.active{background:#e7f0ff;border-color:#8eb0e4;color:#0a5ad4}
+#tracking-table{margin-top:16px}
+#tracking-table[hidden]{display:none}
 #detection-detail{margin:0;line-height:1.5}
 .detection-percent{margin:12px 0 10px;font-size:2.4rem;font-weight:550;letter-spacing:-.04em}
 .detection-track{height:10px;background:#e7edf5;border-radius:99px;overflow:hidden}
 .detection-track span{display:block;height:100%;width:0;background:#0a5ad4;border-radius:99px}
 .detection-time{margin:14px 0 0;color:var(--muted);font-variant-numeric:tabular-nums}
+.detection-actions{display:flex;justify-content:flex-end;margin-top:16px}
+.detection-actions button[hidden]{display:none}
 #detection-dice{margin:8px 0 0;font-weight:650}

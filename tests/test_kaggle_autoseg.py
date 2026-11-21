@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -110,14 +111,14 @@ def test_errors_do_not_repeat_the_token():
     assert kaggle_autoseg._redact("header KGAT_" + "ab" * 16) == "header KGAT_…"
 
 
-def test_startup_stays_on_cpu_unless_a_device_was_chosen(monkeypatch):
+def test_startup_uses_kaggle_unless_a_device_was_chosen(monkeypatch):
     monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "placeholder")
     os.environ.pop("ONCOMETRA_TOTALSEG_DEVICE")
     kaggle_autoseg.prefer_remote_gpu()
-    assert os.environ["ONCOMETRA_TOTALSEG_DEVICE"] == "cpu"
-    monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "kaggle")
-    kaggle_autoseg.prefer_remote_gpu()
     assert os.environ["ONCOMETRA_TOTALSEG_DEVICE"] == "kaggle"
+    monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "cpu")
+    kaggle_autoseg.prefer_remote_gpu()
+    assert os.environ["ONCOMETRA_TOTALSEG_DEVICE"] == "cpu"
 
 
 def test_a_missing_private_dataset_is_created_instead_of_failing():
@@ -160,6 +161,85 @@ def test_the_notebook_reads_the_volume_kaggle_decompresses(tmp_path):
     assert _volume(tmp_path, "image.nii.gz") == tmp_path / "image.nii"
     (tmp_path / "image.nii.gz").write_bytes(b"gz")
     assert _volume(tmp_path, "image.nii.gz") == tmp_path / "image.nii.gz"
+
+
+def test_cancel_asks_kaggle_to_stop_the_session_this_run_started(monkeypatch):
+    seen = {}
+
+    class Kernels:
+        def __init__(self):
+            self.kernels_api_client = self
+
+        def cancel_kernel_session(self, request):
+            seen["id"] = request.kernel_session_id
+            return type("Response", (), {"error_message": ""})()
+
+    class Bundle:
+        def __enter__(self):
+            self.kernels = Kernels()
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Api:
+        def build_kaggle_client(self):
+            return Bundle()
+
+    monkeypatch.setattr(kaggle_autoseg, "_client", lambda: Api())
+    kaggle_autoseg._cancel_unsupported = False
+    kaggle_autoseg._session_id = None
+    kaggle_autoseg._remember_session(50)
+    kaggle_autoseg.cancel_remote_session()
+    assert seen["id"] == 50
+    kaggle_autoseg._session_id = None
+    kaggle_autoseg._cancel_unsupported = False
+
+
+def test_a_token_without_cancel_permission_does_not_raise(monkeypatch):
+    import requests
+
+    class Kernels:
+        def __init__(self):
+            self.kernels_api_client = self
+            self.calls = 0
+
+        def cancel_kernel_session(self, request):
+            self.calls += 1
+            response = type("Response", (), {"status_code": 403, "text": '{"error":{"message":"Permission \'kernelSessions.cancel\' was denied"}}'})()
+            raise requests.HTTPError("403", response=response)
+
+    kernels = Kernels()
+
+    class Bundle:
+        def __enter__(self):
+            self.kernels = kernels
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(kaggle_autoseg, "_client", lambda: type("Api", (), {"build_kaggle_client": staticmethod(lambda: Bundle())})())
+    kaggle_autoseg._cancel_unsupported = False
+    kaggle_autoseg._session_id = 50
+    kaggle_autoseg.cancel_remote_session()
+    kaggle_autoseg.cancel_remote_session()
+    assert kernels.calls == 1
+    assert kaggle_autoseg._cancel_unsupported is True
+    kaggle_autoseg._session_id = None
+    kaggle_autoseg._cancel_unsupported = False
+
+
+def test_the_kernel_wait_stops_as_soon_as_the_reader_cancels():
+    stop = threading.Event()
+
+    class Api:
+        def kernels_status(self, ref):
+            stop.set()
+            return {"status": "QUEUED"}
+
+    with pytest.raises(kaggle_autoseg.RemoteCancelled):
+        kaggle_autoseg._wait_kernel(Api(), "reader/oncometra-totalseg", lambda _detail: None, stop)
 
 
 def test_a_push_is_repeated_until_the_dataset_stays_attached(tmp_path, monkeypatch):

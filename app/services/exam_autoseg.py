@@ -1,9 +1,11 @@
 """Organ HU and a cancer-specific lesion mask for one exam.
 
-TotalSegmentator runs on the CPU in its own environment, or on a private Kaggle
-GPU when ONCOMETRA_TOTALSEG_DEVICE=kaggle. A reader can start it for the open
-exam. The cohort page can send every CT exam of one cohort, one after another.
-An existing DICOM SEG tumor stays in place so the automatic lesion can be compared with it.
+Détecter sends the organ task and the cancer lesion task to a private Kaggle
+GPU. Set ONCOMETRA_TOTALSEG_DEVICE=cpu before `python -m app.oncometra` to keep
+that detection on the local processor. scripts/run.ps1 selects Kaggle. The
+cohort page can send every CT exam of one cohort, one after another. An
+existing DICOM SEG tumor stays in place so the automatic lesion can be compared
+with it.
 """
 
 from __future__ import annotations
@@ -27,6 +29,9 @@ logger = logging.getLogger(__name__)
 ORGAN_TASK = "total"
 _status_lock = threading.Lock()
 _status: dict[str, dict] = {}
+_runs: dict[str, int] = {}
+_cancel_events: dict[str, threading.Event] = {}
+_run_devices: dict[str, str] = {}
 _active_case: str | None = None
 # Open tasks only. Kidney cysts are not a tumor model and are intentionally absent.
 _LESION_TASKS = (
@@ -47,7 +52,7 @@ def segmentation_device() -> str:
     forced = (os.environ.get("ONCOMETRA_TOTALSEG_DEVICE") or os.environ.get("ONCORADAR_TOTALSEG_DEVICE") or "").strip().lower()
     if forced in {"cpu", "gpu", "mps", "kaggle"}:
         return forced
-    return "cpu"
+    return "kaggle"
 
 
 def lesion_task_for_cancer(cancer: str) -> tuple[str, tuple[str, ...]] | None:
@@ -170,7 +175,7 @@ def load_organ_table(case_dir: Path) -> dict | None:
 
 
 def attach_stored_result(case_id: str) -> None:
-    """Copy a finished one-exam result onto the case without replacing a DICOM SEG."""
+    """Copy the organ table onto the case. The segmentation file is never replaced."""
     from app.db import SessionLocal
     from app.oncometra import image_directory
     from app.oncometra_models import WorkspaceCase
@@ -188,26 +193,6 @@ def attach_stored_result(case_id: str) -> None:
     folder = image_directory(case)
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "organs.json").write_text(table.read_text(encoding="utf-8"), encoding="utf-8")
-    reference = folder / "reference.nii.gz"
-    tumor = stored / "tumor.nii.gz"
-    image_path = folder / "image.nii.gz"
-    if reference.exists() or not tumor.is_file() or not image_path.is_file():
-        return
-    image = sitk.ReadImage(str(image_path))
-    mask_image = on_reference_grid(image, sitk.ReadImage(str(tumor)))
-    mask = sitk.GetArrayFromImage(mask_image).astype(np.uint8)
-    if mask.shape != tuple(reversed(image.GetSize())) or not int(mask.sum()):
-        return
-    aligned = sitk.GetImageFromArray(mask)
-    aligned.CopyInformation(image)
-    sitk.WriteImage(aligned, str(reference), True)
-    source["tumor_from_model"] = True
-    source["reference_voxels"] = int(mask.sum())
-    with SessionLocal() as db:
-        row = db.get(WorkspaceCase, case_id)
-        if row is not None:
-            row.source = source
-            db.commit()
 
 
 def dice_score(prediction, reference) -> float | None:
@@ -343,23 +328,43 @@ def detection_status(case_id: str) -> dict:
     return payload
 
 
-def _set_status(case_id: str, **fields) -> None:
+class DetectionCancelled(RuntimeError):
+    """The reader stopped this detection."""
+
+
+def _set_status(case_id: str, *, run_id: int | None = None, **fields) -> None:
     with _status_lock:
+        if run_id is not None and _runs.get(case_id) != run_id:
+            return
         current = dict(_status.get(case_id) or {"state": "idle", "detail": "", "error": "", "seeded": False, "percent": 0})
+        if current.get("state") == "cancelled" and fields.get("state") != "cancelled":
+            return
         if "percent" in fields and current.get("state") == "running" and fields.get("state", "running") == "running":
             fields["percent"] = max(int(current.get("percent") or 0), int(fields["percent"]))
         if fields.get("state") == "done":
             fields["percent"] = 100
             fields.setdefault("finished_at", time.time())
-        elif fields.get("state") == "error":
+        elif fields.get("state") in {"error", "cancelled"}:
             fields.setdefault("finished_at", time.time())
         current.update(fields)
         _status[case_id] = current
 
 
-def start_detection(case_id: str, study_id: str) -> dict:
+def detection_device(requested: str | None = None) -> str:
+    """A click chooses cpu or kaggle. An empty request keeps the process default."""
+    text = (requested or "").strip().lower()
+    if text in {"cpu", "kaggle"}:
+        return text
+    if text:
+        raise RuntimeError("Mode de détection inconnu. Choisis local ou Kaggle.")
+    return segmentation_device()
+
+
+def start_detection(case_id: str, study_id: str, device: str | None = None) -> dict:
     global _active_case
     launch = False
+    run_id = 0
+    chosen = detection_device(device)
     with _status_lock:
         active = _status.get(_active_case or "", {})
         if _active_case and _active_case != case_id and active.get("state") == "running":
@@ -367,32 +372,75 @@ def start_detection(case_id: str, study_id: str) -> dict:
         current = _status.get(case_id) or {}
         if current.get("state") != "running":
             _active_case = case_id
-            detail = "Préparation de l’envoi vers un GPU Kaggle…" if segmentation_device() == "kaggle" else "Préparation de l’examen…"
+            run_id = _runs.get(case_id, 0) + 1
+            _runs[case_id] = run_id
+            _run_devices[case_id] = chosen
+            _cancel_events[case_id] = threading.Event()
+            detail = "Préparation de l’envoi vers un GPU Kaggle…" if chosen == "kaggle" else "Préparation de la détection locale…"
             _status[case_id] = {
                 "state": "running", "detail": detail, "error": "", "seeded": False,
-                "percent": 1, "started_at": time.time(),
+                "percent": 1, "started_at": time.time(), "device": chosen,
             }
             launch = True
     if launch:
-        threading.Thread(target=_detect_worker, args=(case_id, study_id), daemon=True).start()
+        threading.Thread(target=_detect_worker, args=(case_id, study_id, run_id, chosen), daemon=True).start()
     return detection_status(case_id)
 
 
-def _detect_worker(case_id: str, study_id: str) -> None:
-    global _active_case
+def cancel_detection(case_id: str) -> dict:
+    """Stop the detection shown in the dialog and ask Kaggle to drop its notebook."""
+    event = None
+    with _status_lock:
+        current = _status.get(case_id) or {}
+        if current.get("state") == "running":
+            event = _cancel_events.get(case_id)
+            if event is not None:
+                event.set()
+            current.update({
+                "state": "cancelled", "detail": "Détection annulée.", "error": "",
+                "finished_at": time.time(),
+            })
+            _status[case_id] = current
+    if event is not None and _run_devices.get(case_id) == "kaggle":
+        threading.Thread(target=_cancel_remote, daemon=True).start()
+    return detection_status(case_id)
+
+
+def _cancel_remote() -> None:
     try:
-        result = execute_case(case_id, study_id, report=_set_status)
-        _set_status(case_id, state="done", detail=result["detail"], error="", seeded=result["seeded"], dice=result.get("dice"))
+        from app.services.kaggle_autoseg import cancel_remote_session
+        cancel_remote_session()
+    except Exception:
+        logger.exception("Kaggle did not confirm the cancellation")
+
+
+def _detect_worker(case_id: str, study_id: str, run_id: int, device: str) -> None:
+    global _active_case
+    from app.services.kaggle_autoseg import RemoteCancelled
+
+    def report(target: str, **fields) -> None:
+        _set_status(target, run_id=run_id, **fields)
+
+    try:
+        result = execute_case(case_id, study_id, report=report, device=device)
+        if _cancel_events.get(case_id) is not None and _cancel_events[case_id].is_set():
+            raise DetectionCancelled()
+        _set_status(case_id, run_id=run_id, state="done", detail=result["detail"], error="", seeded=result["seeded"], dice=result.get("dice"))
+    except (DetectionCancelled, RemoteCancelled):
+        _set_status(case_id, run_id=run_id, state="cancelled", detail="Détection annulée.", error="", seeded=False)
     except Exception as error:
-        logger.exception("Automatic detection failed for %s", case_id)
-        _set_status(case_id, state="error", detail="", error=str(error), seeded=False)
+        if _cancel_events.get(case_id) is not None and _cancel_events[case_id].is_set():
+            _set_status(case_id, run_id=run_id, state="cancelled", detail="Détection annulée.", error="", seeded=False)
+        else:
+            logger.exception("Automatic detection failed for %s", case_id)
+            _set_status(case_id, run_id=run_id, state="error", detail="", error=str(error), seeded=False)
     finally:
         with _status_lock:
-            if _active_case == case_id:
+            if _active_case == case_id and _runs.get(case_id) == run_id:
                 _active_case = None
 
 
-def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
+def execute_case(case_id: str, study_id: str, runner=None, report=None, device: str | None = None) -> dict:
     """Segment one exam. An existing organ file is reused instead of running twice."""
     from app.db import SessionLocal
     from app.oncometra_models import WorkspaceCase, WorkspaceProject
@@ -423,6 +471,9 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
     sent = {"percent": 1}
 
     def emit(percent: int, detail: str) -> None:
+        event = _cancel_events.get(case_id)
+        if event is not None and event.is_set():
+            raise DetectionCancelled()
         percent = max(sent["percent"], int(percent))
         sent["percent"] = percent
         report(case_id, state="running", detail=detail, error="", seeded=False, percent=percent)
@@ -443,15 +494,19 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
             runner(task, source_path, output, fast=fast)
         emit(high, detail)
 
-    if segmentation_device() == "kaggle":
+    remote = detection_device(device) == "kaggle"
+    if remote:
         from app.services.kaggle_autoseg import ensure_remote_masks
         ensure_remote_masks(
             image_path, uid, chosen[0] if chosen else None, stored,
             report=lambda detail: emit(remote_percent(detail), detail),
+            stop=_cancel_events.get(case_id),
         )
     organs_path = stored / "organs.nii.gz"
     if organs_path.is_file():
         emit(organ_high, "Organes déjà calculés.")
+    elif remote:
+        raise RuntimeError("Le GPU Kaggle n’a pas renvoyé le masque des organes.")
     else:
         segment(ORGAN_TASK, image_path, organs_path, fast=True, low=organ_low, high=organ_high, detail="Segmentation des organes…")
     names = class_names(ORGAN_TASK)
@@ -478,6 +533,8 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
         lesions_path = stored / "lesions.nii.gz"
         if lesions_path.is_file():
             emit(lesion_high, "Lésions déjà calculées.")
+        elif remote:
+            raise RuntimeError("Le GPU Kaggle n’a pas renvoyé le masque des lésions.")
         else:
             try:
                 segment(tumor_task, image_path, lesions_path, fast=False, low=lesion_low, high=lesion_high, detail="Segmentation des lésions…")
@@ -496,17 +553,9 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
                 tumor = sitk.GetImageFromArray(mask.astype(np.uint8))
                 tumor.CopyInformation(image)
                 sitk.WriteImage(tumor, str(stored / "tumor.nii.gz"), True)
-                outcome = _record_ai_lesion(study_id, mask)
-                seeded = outcome == "added"
-                tumor_note = f"Lésions proposées par {tumor_task}."
-                if seeded:
-                    tumor_note += " La lésion « AI lesion detection » a été ajoutée."
-                elif outcome == "covered":
-                    tumor_note += " Elle est déjà couverte par une lésion enregistrée."
+                tumor_note = f"Lésions proposées par {tumor_task}. La lésion « AI lesion detection » est affichée avec les organes."
                 if seg_kept:
                     tumor_note += " Le segment SEG est conservé pour la comparaison."
-                elif not seeded and (folder / "reference.nii.gz").exists():
-                    tumor_note += " Le brouillon déjà commencé n’a pas été remplacé."
             else:
                 tumor_note = f"La tâche {tumor_task} n’a trouvé aucune lésion."
                 if seg_kept:
@@ -522,13 +571,13 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
     if lesion_mask is not None:
         labels = organ_labels.copy()
         labels[lesion_mask > 0] = np.uint16(65000)
-        legend.append({"id": 65000, "name": "lesion", "label": "Lésion", "color": [0, 188, 255]})
+        legend.append({"id": 65000, "name": "lesion", "label": AI_LESION_NAME, "color": [0, 188, 255]})
     volume = sitk.GetImageFromArray(labels)
     volume.CopyInformation(image)
     sitk.WriteImage(volume, str(folder / "organ_labels.nii.gz"), True)
     emit(96, "Calcul des unités Hounsfield…")
     payload = {
-        "cancer": cancer, "organ_task": ORGAN_TASK, "organ_mode": "fast", "device": "cpu",
+        "cancer": cancer, "organ_task": ORGAN_TASK, "organ_mode": "fast", "device": "kaggle" if remote else "cpu",
         "tumor_task": tumor_task, "tumor_note": tumor_note, "dice": dice, "legend": legend,
         "organs": hu_rows(sitk.GetArrayFromImage(image), organ_labels, names, voxel_mm3),
     }
@@ -540,61 +589,6 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None) -> dict:
 
 
 AI_LESION_NAME = "AI lesion detection"
-
-
-def _record_ai_lesion(study_id: str, lesion_mask) -> str:
-    """Add the detected lesion to the annotation list without replacing another lesion."""
-    from fastapi import HTTPException
-    from app.db import SessionLocal
-    from app.lung_api import current_mask, image_for, nodules_for, save_revision, check_editable
-    from app.models import AnnotationHead
-    from app.oncometra import user_payload
-    from app.oncometra_models import WorkspaceAssignment, WorkspaceUser
-    from app.services.nodules import MAX_NODULE_LABEL, new_nodule
-
-    with SessionLocal() as db:
-        head = db.get(AnnotationHead, study_id)
-        assignment = db.get(WorkspaceAssignment, study_id)
-        user = db.get(WorkspaceUser, assignment.user_id) if assignment else None
-        if head is None or user is None:
-            return "skipped"
-        try:
-            check_editable(db, head)
-            image = image_for(str(study_id))
-        except HTTPException:
-            return "skipped"
-        mask = current_mask(head, image)
-        detected = np.asarray(lesion_mask) > 0
-        if mask.shape != detected.shape or not int(detected.sum()):
-            return "skipped"
-        if head.revision_id:
-            nodules = nodules_for(db, head)
-            existing = next((item for item in nodules if item.get("name") == AI_LESION_NAME), None)
-            if existing:
-                label = int(existing["label"])
-                mask[mask == label] = 0
-            else:
-                label = max(int(item["label"]) for item in nodules) + 1
-                if label > MAX_NODULE_LABEL:
-                    return "skipped"
-                nodule = new_nodule(label)
-                nodule["name"] = AI_LESION_NAME
-                nodule["color"] = [0, 188, 255]
-                nodules = [*nodules, nodule]
-        else:
-            label = 1
-            nodule = new_nodule(label)
-            nodule["name"] = AI_LESION_NAME
-            nodule["color"] = [0, 188, 255]
-            nodules = [nodule]
-        painted = detected & ((mask == 0) | (mask == label))
-        if not int(painted.sum()):
-            return "covered"
-        mask[painted] = np.uint8(label)
-        db.info["annotation_actor"] = user_payload(user)
-        save_revision(db, head, image, mask, "ai-lesion",
-                      {"source": AI_LESION_NAME, "nodule_label": label}, nodules, changed_nodule=label)
-        return "added"
 
 
 _DICE_NOTE = re.compile(r"\s*Score Dice[^.]+\.")

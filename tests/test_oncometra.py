@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import zipfile
 from uuid import uuid4
@@ -510,6 +511,7 @@ def test_one_exam_detection_publishes_distinct_organ_colors(clients, monkeypatch
     admin, _, _ = clients
     case = fixture_case()
     study = assigned(admin, case)
+    monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "cpu")
     calls = []
 
     def runner(task, source, output, *, fast):
@@ -529,7 +531,7 @@ def test_one_exam_detection_publishes_distinct_organ_colors(clients, monkeypatch
     overlay = admin.get(f"/api/studies/{study}/organ-overlay")
     assert overlay.status_code == 200, overlay.text
     legend = overlay.json()["legend"]
-    assert [item["label"] for item in legend] == ["liver", "spleen", "Lésion"]
+    assert [item["label"] for item in legend] == ["liver", "spleen", "AI lesion detection"]
     assert legend[0]["color"] != legend[1]["color"]
     assert legend[2]["color"] == [0, 188, 255]
     voxels = admin.get(f"/api/studies/{study}/organ-overlay/voxels")
@@ -554,6 +556,7 @@ def test_detection_keeps_seg_and_still_runs_the_lesion_task(clients, monkeypatch
     admin, _, _ = clients
     case = fixture_case()
     study = assigned(admin, case)
+    monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "cpu")
     reference = image_directory(case) / "reference.nii.gz"
     before = reference.read_bytes()
     with SessionLocal() as db:
@@ -577,17 +580,18 @@ def test_detection_keeps_seg_and_still_runs_the_lesion_task(clients, monkeypatch
     monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver"} if task == "total" else {1: "lung_nodule"})
     result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
     assert calls == [("total", True), ("lung_nodules", False)]
-    assert result["seeded"] is True
-    assert "AI lesion detection" in result["detail"]
+    assert result["seeded"] is False
+    assert "affichée avec les organes" in result["detail"]
     assert "SEG est conservé" in result["detail"]
     assert reference.read_bytes() == before
-    from app.models import AnnotationHead, AnnotationRevision
+    from app.models import AnnotationHead
     with SessionLocal() as db:
         head = db.get(AnnotationHead, study)
-        saved = db.get(AnnotationRevision, head.revision_id)
-    assert [item["name"] for item in saved.details["nodules"]] == ["AI lesion detection"]
+    assert head.revision_id is None
     legend = admin.get(f"/api/studies/{study}/organ-overlay").json()
     assert legend["legend"][-1]["id"] == 65000
+    assert legend["legend"][-1]["label"] == "AI lesion detection"
+    assert admin.get(f"/api/lung/studies/{study}").json()["segmentation_file"] is True
     assert isinstance(legend["dice"], float)
     assert 0 <= legend["dice"] <= 1
     with SessionLocal() as db:
@@ -607,7 +611,7 @@ def test_kaggle_device_fetches_both_masks_and_skips_the_local_binary(clients, mo
     monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "kaggle")
     seen = []
 
-    def remote(image_path, uid, lesion_task, dest, report=None):
+    def remote(image_path, uid, lesion_task, dest, report=None, stop=None):
         seen.append(lesion_task)
         image = sitk.ReadImage(str(image_path))
         labels = np.zeros(tuple(reversed(image.GetSize())), np.uint16)
@@ -624,9 +628,55 @@ def test_kaggle_device_fetches_both_masks_and_skips_the_local_binary(clients, mo
     monkeypatch.setattr("app.services.kaggle_autoseg.ensure_remote_masks", remote)
     monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver", 2: "spleen"} if task == "total" else {1: "lung_nodule"})
     result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
+    saved = json.loads((image_directory(case) / "organs.json").read_text(encoding="utf-8"))
+    assert saved["device"] == "kaggle"
     assert seen == ["lung_nodules"]
     assert "Lésions proposées par lung_nodules" in result["detail"]
     assert "AI lesion detection" in result["detail"]
+
+
+def test_a_covered_draft_still_receives_the_algorithm_name(clients, monkeypatch):
+    from app.lung_api import current_mask, image_for, save_revision
+    from app.models import AnnotationHead, AnnotationRevision
+    from app.services import exam_autoseg
+    from app.services.nodules import new_nodule
+    admin, _, _ = clients
+    case = fixture_case()
+    study = assigned(admin, case)
+    monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "cpu")
+    image = image_for(study)
+    draft = np.zeros(tuple(reversed(image.GetSize())), np.uint8)
+    draft[0, 0, :4] = 1
+    draft[0, 1, :4] = 1
+    nodule = new_nodule(1)
+    nodule["name"] = "Tumeur"
+    with SessionLocal() as db:
+        head = db.get(AnnotationHead, study)
+        save_revision(db, head, image, draft, "source-segmentation", {"source": "draft"}, [nodule])
+        db.commit()
+
+    def runner(task, source_path, output, *, fast):
+        volume = sitk.ReadImage(str(source_path))
+        labels = np.zeros(tuple(reversed(volume.GetSize())), np.uint16)
+        labels[0, 0, :4] = 1
+        painted = sitk.GetImageFromArray(labels)
+        painted.CopyInformation(volume)
+        sitk.WriteImage(painted, str(output), True)
+
+    monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver"} if task == "total" else {1: "lung_nodule"})
+    result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
+    assert "affichée avec les organes" in result["detail"]
+    with SessionLocal() as db:
+        head = db.get(AnnotationHead, study)
+        saved = db.get(AnnotationRevision, head.revision_id)
+        assert [item["name"] for item in saved.details["nodules"]] == ["Tumeur"]
+        mask = current_mask(head, image_for(study))
+    assert int(mask[0, 0, 0]) == 1
+    assert int(mask[0, 1, 0]) == 1
+    organs = sitk.GetArrayFromImage(sitk.ReadImage(str(image_directory(case) / "organ_labels.nii.gz")))
+    assert int(organs[0, 0, 0]) == 65000
+    assert int(organs[0, 1, 0]) != 65000
+    assert admin.get(f"/api/lung/studies/{study}").json()["segmentation_file"] is False
 
 
 def test_ai_segmentation_is_reserved_for_an_administrator(clients, monkeypatch):
@@ -672,3 +722,138 @@ def test_dice_score_measures_overlap_with_the_reference_segment():
     assert exam_autoseg.detection_status(case_id)["elapsed_s"] == 12
     assert exam_autoseg.detection_status(case_id)["percent"] == 100
     exam_autoseg._status.pop(case_id, None)
+
+
+def test_cancel_stops_the_running_detection(clients, monkeypatch):
+    from app.services import exam_autoseg
+    admin, _, _ = clients
+    case = fixture_case()
+    study = assigned(admin, case)
+    started = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr("app.services.kaggle_autoseg.cancel_remote_session", lambda: None)
+
+    def blocked(case_id, study_id, runner=None, report=None, device=None):
+        started.set()
+        release.wait(3)
+        return {"detail": "ne doit pas remplacer l’annulation", "seeded": False, "dice": None}
+
+    monkeypatch.setattr(exam_autoseg, "execute_case", blocked)
+    launched = admin.post(f"/api/studies/{study}/autoseg")
+    assert launched.status_code == 202
+    assert started.wait(2)
+    cancelled = admin.post(f"/api/studies/{study}/autoseg/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["state"] == "cancelled"
+    assert cancelled.json()["detail"] == "Détection annulée."
+    release.set()
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        if admin.get(f"/api/studies/{study}/autoseg").json()["state"] == "cancelled":
+            break
+        time.sleep(0.05)
+    assert admin.get(f"/api/studies/{study}/autoseg").json()["state"] == "cancelled"
+    exam_autoseg._status.pop(case.id, None)
+    exam_autoseg._active_case = None
+
+
+def test_the_detect_button_can_choose_local_while_the_server_defaults_to_kaggle(clients, monkeypatch):
+    from app.services import exam_autoseg
+    admin, _, _ = clients
+    case = fixture_case()
+    study = assigned(admin, case)
+    seen = {}
+
+    def blocked(case_id, study_id, runner=None, report=None, device=None):
+        seen["device"] = device
+        return {"detail": "local", "seeded": False, "dice": None}
+
+    monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "kaggle")
+    monkeypatch.setattr(exam_autoseg, "execute_case", blocked)
+    launched = admin.post(f"/api/studies/{study}/autoseg", json={"device": "cpu"})
+    assert launched.status_code == 202
+    assert launched.json()["device"] == "cpu"
+    assert "locale" in launched.json()["detail"]
+    deadline = time.time() + 2
+    while time.time() < deadline and seen.get("device") != "cpu":
+        time.sleep(0.05)
+    assert seen["device"] == "cpu"
+    refused = admin.post(f"/api/studies/{study}/autoseg", json={"device": "cloud"})
+    assert refused.status_code == 422
+    exam_autoseg._status.pop(case.id, None)
+    exam_autoseg._active_case = None
+
+
+def _share_patient(case, patient, timepoint, organs=None, lesions=None):
+    from app.services.exam_autoseg import series_result_dir
+    uid = f"series-{case.id}"
+    if organs is not None:
+        image = sitk.ReadImage(str(image_directory(case) / "image.nii.gz"))
+        dest = series_result_dir(uid)
+        dest.mkdir(parents=True, exist_ok=True)
+        for name, array in (("organs.nii.gz", organs), ("lesions.nii.gz", lesions)):
+            volume = sitk.GetImageFromArray(np.asarray(array, dtype=np.uint16))
+            volume.CopyInformation(image)
+            sitk.WriteImage(volume, str(dest / name), True)
+    with SessionLocal() as db:
+        stored = db.get(WorkspaceCase, case.id)
+        source = dict(stored.source or {})
+        source.update({
+            "series_instance_uid": uid,
+            "local_path": "tests",
+            "local_patient": patient,
+            "local_timepoint": timepoint,
+        })
+        stored.source = source
+        db.commit()
+
+
+def test_follow_numbers_one_liver_lesion_across_dates_and_skips_a_bare_exam(clients, monkeypatch):
+    admin, _, _ = clients
+    patient = "HCC-" + str(uuid4())[:8]
+    first, second, bare = fixture_case(), fixture_case(), fixture_case()
+    organs = np.full((24, 24, 24), 5, np.uint16)
+    lesions = np.zeros((24, 24, 24), np.uint16)
+    lesions[8:12, 8:12, 8:12] = 1
+    _share_patient(first, patient, "1999-04-30/series-a", organs, lesions)
+    _share_patient(second, patient, "1999-06-01/series-b", organs, lesions)
+    _share_patient(bare, patient, "1999-08-01/series-c")
+    alone = assigned(admin, fixture_case())
+    assert admin.post(f"/api/studies/{alone}/lesion-tracking").status_code == 422
+
+    class Identity:
+        def warp_labels(self, fixed, moving, labels):
+            return np.asarray(labels)
+
+    monkeypatch.setattr("app.services.lesion_tracking.make_registrar", lambda *_args, **_kwargs: Identity())
+    study = assigned(admin, second)
+    launched = admin.post(f"/api/studies/{study}/lesion-tracking")
+    assert launched.status_code == 202
+    assert launched.json()["state"] == "running"
+    deadline = time.time() + 5
+    status = launched.json()
+    while time.time() < deadline and status["state"] == "running":
+        time.sleep(0.05)
+        status = admin.get(f"/api/studies/{study}/lesion-tracking").json()
+    assert status["state"] == "done", status
+    assert status["percent"] == 100
+    assert status["elapsed_s"] >= 0
+    assert status["baseline"] == "1999-04-30"
+    assert status["skipped"] == ["1999-08-01"]
+    assert "1 examen ignoré" in status["detail"]
+    rows = {(row["time_id"], row["lesion_id"]): row for row in status["lesions"]}
+    assert rows[("1999-04-30", 1)]["status"] == "nouvelle"
+    assert rows[("1999-06-01", 1)]["status"] == "stable"
+    assigned(admin, first)
+    view = admin.get(f"/api/studies/{study}/longitudinal")
+    assert view.status_code == 200, view.text
+    body = view.json()
+    assert [item["time_id"] for item in body["dates"]] == ["1999-04-30", "1999-06-01"]
+    assert body["dates"][0]["lesions"][0]["axial_index"] == 10
+    assert body["rows"][0]["delta_percent"] == 0
+    labels = admin.get(f"/api/studies/{study}/longitudinal/labels", params={"time": "1999-06-01"})
+    assert labels.status_code == 200
+    assert labels.content
+    saved = admin.get(f"/api/studies/{assigned(admin, first)}/lesion-tracking").json()
+    assert saved["baseline"] == "1999-04-30"
+    assert saved["stored"] is True

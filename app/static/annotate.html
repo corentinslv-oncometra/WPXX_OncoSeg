@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Oncometra | Annotation</title>
-  <link rel="stylesheet" href="/annotate.css?v=organs-4">
+  <link rel="stylesheet" href="/annotate.css?v=follow-4">
   <link rel="stylesheet" href="/assets/oncometra-viewer.css?v=fullscreen-1">
-  <script type="module" src="/annotate.js?v=organs-17"></script>
+  <script type="module" src="/annotate.js?v=follow-4"></script>
 </head>
 <body>
   <header class="topbar">
@@ -45,8 +45,8 @@
       <label class="inline-control numeric">L <input id="window-level" type="number" value="-600" min="-3000" max="3000"></label>
       <button id="reset-view" title="Reset zoom and pan">Fit</button>
       <button id="toggle-mpr" class="active" title="Focus selected view or restore all planes; double-click a view to toggle">Focus view</button>
-      <button id="toggle-overlay" class="active" title="Toggle mask visibility (M)">Mask</button>
-      <button id="toggle-organs" class="active" title="Afficher ou masquer les couleurs de la détection automatique">Organes</button>
+      <button id="toggle-overlay" class="active" title="Affiche uniquement le fichier de segmentation déjà présent.">Mask</button>
+      <button id="toggle-organs" class="active" title="Affiche uniquement les organes et la lésion détectés par l’IA.">Organes</button>
       <span class="top-spacer"></span><span id="save-state" class="save-state">No draft</span>
       <button id="export-mask" disabled>Export case</button>
       <button id="toggle-inspector" aria-expanded="true" title="Show or hide the inspector">Inspector</button>
@@ -87,8 +87,10 @@
         <div class="viewport coronal" data-plane="coronal"><div class="viewport-label"><b>CORONAL</b><span class="plane-position"></span></div><canvas aria-label="Coronal CT image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><div class="slice-bar"><input type="range" min="0" value="0" aria-label="Coronal slice"><div class="tumor-marks" title="Coupes où une tumeur est signalée"></div></div></div></div>
         <div class="viewport sagittal" data-plane="sagittal"><div class="viewport-label"><b>SAGITTAL</b><span class="plane-position"></span></div><canvas aria-label="Sagittal CT image"></canvas><span class="orient top"></span><span class="orient left"></span><span class="orient right"></span><span class="orient bottom"></span><div class="viewport-bottom"><span class="view-info"></span><div class="slice-bar"><input type="range" min="0" value="0" aria-label="Sagittal slice"><div class="tumor-marks" title="Coupes où une tumeur est signalée"></div></div></div></div>
         <div id="viewer-empty" class="viewer-empty"><h2>No CT selected</h2><p>Select a CT series from the worklist.</p><button data-page="cases">Open worklist</button></div>
+        <section id="longitudinal-view" aria-label="Suivi longitudinal"></section>
       </section>
       <aside id="inspector" class="inspector">
+        <div id="follow-inspector"></div>
         <div class="inspector-head"><h2>Nodules <span id="nodule-count">0</span></h2><button id="add-nodule" disabled>Add nodule</button></div>
         <p id="lesion-dice" class="lesion-dice" hidden></p>
         <div id="nodule-list" class="nodule-list" aria-label="Nodules"></div>
