@@ -553,7 +553,15 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None, device: 
                 tumor = sitk.GetImageFromArray(mask.astype(np.uint8))
                 tumor.CopyInformation(image)
                 sitk.WriteImage(tumor, str(stored / "tumor.nii.gz"), True)
-                tumor_note = f"Lésions proposées par {tumor_task}. La lésion « AI lesion detection » est affichée avec les organes."
+                outcome = _record_ai_lesion(study_id, mask)
+                seeded = outcome == "added"
+                tumor_note = f"Lésions proposées par {tumor_task}."
+                if seeded:
+                    tumor_note += " La lésion « AI lesion detection » a été ajoutée."
+                elif outcome == "covered":
+                    tumor_note += " Elle est déjà couverte par une lésion enregistrée."
+                else:
+                    tumor_note += " La lésion « AI lesion detection » est affichée avec les organes."
                 if seg_kept:
                     tumor_note += " Le segment SEG est conservé pour la comparaison."
             else:
@@ -589,10 +597,70 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None, device: 
 
 
 AI_LESION_NAME = "AI lesion detection"
+AI_CYAN = [0, 188, 255]
+
+
+def _record_ai_lesion(study_id: str, lesion_mask) -> str:
+    """Add the detected lesion to the annotation list without replacing another lesion."""
+    from fastapi import HTTPException
+    from app.db import SessionLocal
+    from app.lung_api import check_editable, current_mask, image_for, nodules_for, save_revision
+    from app.models import AnnotationHead
+    from app.oncometra import user_payload
+    from app.oncometra_models import WorkspaceAssignment, WorkspaceUser
+    from app.services.nodules import MAX_NODULE_LABEL, new_nodule
+
+    with SessionLocal() as db:
+        head = db.get(AnnotationHead, study_id)
+        assignment = db.get(WorkspaceAssignment, study_id)
+        user = db.get(WorkspaceUser, assignment.user_id) if assignment else None
+        if head is None or user is None:
+            return "skipped"
+        try:
+            check_editable(db, head)
+            image = image_for(str(study_id))
+        except HTTPException:
+            return "skipped"
+        mask = current_mask(head, image)
+        detected = np.asarray(lesion_mask) > 0
+        if mask.shape != detected.shape or not int(detected.sum()):
+            return "skipped"
+        if head.revision_id:
+            nodules = nodules_for(db, head)
+            existing = next((item for item in nodules if item.get("name") == AI_LESION_NAME), None)
+            if existing:
+                label = int(existing["label"])
+                mask[mask == label] = 0
+            else:
+                from app.models import AnnotationRevision
+                revision = db.get(AnnotationRevision, head.revision_id)
+                used = [int(item["label"]) for item in nodules]
+                if revision is not None:
+                    used.append(int((revision.details or {}).get("max_nodule_label") or 0))
+                label = max(used, default=0) + 1
+                if label > MAX_NODULE_LABEL:
+                    return "skipped"
+                nodule = new_nodule(label)
+                nodule["name"] = AI_LESION_NAME
+                nodule["color"] = list(AI_CYAN)
+                nodules = [*nodules, nodule]
+        else:
+            label = 1
+            nodule = new_nodule(label)
+            nodule["name"] = AI_LESION_NAME
+            nodule["color"] = list(AI_CYAN)
+            nodules = [nodule]
+        painted = detected & ((mask == 0) | (mask == label))
+        if not int(painted.sum()):
+            return "covered"
+        mask[painted] = np.uint8(label)
+        db.info["annotation_actor"] = user_payload(user)
+        save_revision(db, head, image, mask, "ai-lesion",
+                      {"source": AI_LESION_NAME, "nodule_label": label}, nodules, changed_nodule=label)
+        return "added"
 
 
 _DICE_NOTE = re.compile(r"\s*Score Dice[^.]+\.")
-AI_CYAN = [0, 188, 255]
 
 
 def _with_ai_color(legend: list) -> list:

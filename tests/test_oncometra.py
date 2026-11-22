@@ -580,14 +580,15 @@ def test_detection_keeps_seg_and_still_runs_the_lesion_task(clients, monkeypatch
     monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver"} if task == "total" else {1: "lung_nodule"})
     result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
     assert calls == [("total", True), ("lung_nodules", False)]
-    assert result["seeded"] is False
-    assert "affichée avec les organes" in result["detail"]
+    assert result["seeded"] is True
+    assert "a été ajoutée" in result["detail"]
     assert "SEG est conservé" in result["detail"]
     assert reference.read_bytes() == before
-    from app.models import AnnotationHead
+    from app.models import AnnotationHead, AnnotationRevision
     with SessionLocal() as db:
         head = db.get(AnnotationHead, study)
-    assert head.revision_id is None
+        saved = db.get(AnnotationRevision, head.revision_id)
+    assert [item["name"] for item in saved.details["nodules"]] == ["AI lesion detection"]
     legend = admin.get(f"/api/studies/{study}/organ-overlay").json()
     assert legend["legend"][-1]["id"] == 65000
     assert legend["legend"][-1]["label"] == "AI lesion detection"
@@ -635,6 +636,39 @@ def test_kaggle_device_fetches_both_masks_and_skips_the_local_binary(clients, mo
     assert "AI lesion detection" in result["detail"]
 
 
+def test_detection_numbers_the_ai_lesion_after_the_column_was_emptied(clients, monkeypatch):
+    from app.lung_api import current_mask, image_for, save_revision
+    from app.models import AnnotationHead, AnnotationRevision
+    from app.services import exam_autoseg
+    admin, _, _ = clients
+    case = fixture_case()
+    study = assigned(admin, case)
+    monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "cpu")
+    image = image_for(study)
+    blank = np.zeros(tuple(reversed(image.GetSize())), np.uint8)
+    with SessionLocal() as db:
+        head = db.get(AnnotationHead, study)
+        save_revision(db, head, image, blank, "delete-mask", {"scope": "selected_nodule"}, [], changed_nodule=None)
+        db.commit()
+
+    def runner(task, source_path, output, *, fast):
+        volume = sitk.ReadImage(str(source_path))
+        labels = np.zeros(tuple(reversed(volume.GetSize())), np.uint16)
+        labels[0, 0, :4] = 1
+        painted = sitk.GetImageFromArray(labels)
+        painted.CopyInformation(volume)
+        sitk.WriteImage(painted, str(output), True)
+
+    monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver"} if task == "total" else {1: "lung_nodule"})
+    result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
+    assert result["seeded"] is True
+    with SessionLocal() as db:
+        head = db.get(AnnotationHead, study)
+        saved = db.get(AnnotationRevision, head.revision_id)
+    assert [(item["id"], item["name"]) for item in saved.details["nodules"]] == [("N2", "AI lesion detection")]
+    assert int(current_mask(head, image)[0, 0, 0]) == 2
+
+
 def test_a_covered_draft_still_receives_the_algorithm_name(clients, monkeypatch):
     from app.lung_api import current_mask, image_for, save_revision
     from app.models import AnnotationHead, AnnotationRevision
@@ -665,7 +699,7 @@ def test_a_covered_draft_still_receives_the_algorithm_name(clients, monkeypatch)
 
     monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver"} if task == "total" else {1: "lung_nodule"})
     result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
-    assert "affichée avec les organes" in result["detail"]
+    assert "déjà couverte" in result["detail"]
     with SessionLocal() as db:
         head = db.get(AnnotationHead, study)
         saved = db.get(AnnotationRevision, head.revision_id)

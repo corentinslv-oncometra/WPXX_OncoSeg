@@ -1237,7 +1237,14 @@ $("test-identity").addEventListener('change', task(async () => {
 window.addEventListener("message", (event) => {
   if (event.origin !== location.origin) return;
   if (event.data?.type === "oncometra:load-organs") {
-    task(async () => { await loadOrgans(); })();
+    task(async () => {
+      if (event.data.seeded) {
+        await reloadDraft();
+        const detected = (state.meta?.nodules || []).find((nodule) => nodule.name === "AI lesion detection");
+        if (detected) selectNodule(detected.label);
+      }
+      await loadOrgans();
+    })();
     return;
   }
   if (event.data?.type !== "oncometra:longitudinal") return;
