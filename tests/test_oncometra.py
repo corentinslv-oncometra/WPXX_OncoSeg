@@ -526,7 +526,7 @@ def test_one_exam_detection_publishes_distinct_organ_colors(clients, monkeypatch
 
     monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver", 2: "spleen"} if task == "total" else {1: "lung_nodule"})
     result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
-    assert calls == [("total", True), ("lung_nodules", False)]
+    assert calls == [("total", False), ("lung_nodules", False)]
     assert result["detail"].startswith("2 organes colorés")
     overlay = admin.get(f"/api/studies/{study}/organ-overlay")
     assert overlay.status_code == 200, overlay.text
@@ -549,6 +549,34 @@ def test_one_exam_detection_publishes_distinct_organ_colors(clients, monkeypatch
     finally:
         exam_autoseg._active_case = None
         exam_autoseg._status.pop("busy", None)
+
+
+def test_a_local_fast_organ_mask_is_recomputed_at_full_resolution(clients, monkeypatch):
+    from app.services import exam_autoseg
+    admin, _, _ = clients
+    case = fixture_case()
+    study = assigned(admin, case)
+    monkeypatch.setenv("ONCOMETRA_TOTALSEG_DEVICE", "cpu")
+    stored = exam_autoseg.series_result_dir(case.id)
+    stored.mkdir(parents=True, exist_ok=True)
+    image = sitk.ReadImage(str(image_directory(case) / "image.nii.gz"))
+    blank = sitk.Image(image.GetSize(), sitk.sitkUInt16)
+    blank.CopyInformation(image)
+    sitk.WriteImage(blank, str(stored / "organs.nii.gz"), True)
+    (stored / "hu.json").write_text(json.dumps({"organ_mode": "fast", "device": "cpu"}), encoding="utf-8")
+    calls = []
+
+    def runner(task, source_path, output, *, fast):
+        calls.append((task, fast))
+        painted = sitk.Image(image.GetSize(), sitk.sitkUInt16)
+        painted.CopyInformation(image)
+        sitk.WriteImage(painted, str(output), True)
+
+    monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver"} if task == "total" else {1: "lung_nodule"})
+    exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
+    assert calls[0] == ("total", False)
+    saved = json.loads((stored / "hu.json").read_text(encoding="utf-8"))
+    assert saved["organ_mode"] == "full"
 
 
 def test_detection_keeps_seg_and_still_runs_the_lesion_task(clients, monkeypatch):
@@ -579,7 +607,7 @@ def test_detection_keeps_seg_and_still_runs_the_lesion_task(clients, monkeypatch
 
     monkeypatch.setattr(exam_autoseg, "class_names", lambda task: {1: "liver"} if task == "total" else {1: "lung_nodule"})
     result = exam_autoseg.execute_case(case.id, study, runner=runner, report=lambda *_args, **_fields: None)
-    assert calls == [("total", True), ("lung_nodules", False)]
+    assert calls == [("total", False), ("lung_nodules", False)]
     assert result["seeded"] is True
     assert "a été ajoutée" in result["detail"]
     assert "SEG est conservé" in result["detail"]
@@ -840,6 +868,59 @@ def _share_patient(case, patient, timepoint, organs=None, lesions=None):
         })
         stored.source = source
         db.commit()
+
+
+def test_the_folder_segmentation_joins_the_column_beside_the_ai_lesion(clients):
+    from app.lung_api import current_mask, image_for, save_revision
+    from app.models import AnnotationHead
+    from app.services.nodules import new_nodule
+    admin, _, _ = clients
+    case = fixture_case()
+    study = assigned(admin, case)
+    with SessionLocal() as db:
+        row = db.get(WorkspaceCase, case.id)
+        source = dict(row.source or {})
+        source["tumor_from_seg"] = True
+        row.source = source
+        image = image_for(study)
+        mask = np.zeros(tuple(reversed(image.GetSize())), np.uint8)
+        mask[0, 0, :4] = 2
+        head = db.get(AnnotationHead, study)
+        nodule = new_nodule(2)
+        nodule["name"] = "AI lesion detection"
+        save_revision(db, head, image, mask, "ai-lesion", {"source": "AI lesion detection"}, [nodule], changed_nodule=2)
+        db.commit()
+    opened = admin.get(f"/api/lung/studies/{study}")
+    assert opened.status_code == 200, opened.text
+    names = [item["name"] for item in opened.json()["nodules"]]
+    assert names == ["AI lesion detection", "Tumeur"]
+    again = admin.get(f"/api/lung/studies/{study}")
+    assert [item["name"] for item in again.json()["nodules"]] == names
+    assert again.json()["version"] == opened.json()["version"]
+    with SessionLocal() as db:
+        head = db.get(AnnotationHead, study)
+        stored = current_mask(head, image_for(study))
+    assert int(stored[0, 0, 0]) == 2
+    assert int(stored[8, 8, 8]) != 2
+    assert int(stored[8, 8, 8]) > 0
+
+
+def test_the_mask_button_reads_the_folder_segmentation(clients):
+    admin, _, _ = clients
+    case = fixture_case()
+    study = assigned(admin, case)
+    response = admin.get(f"/api/studies/{study}/segmentation")
+    assert response.status_code == 200, response.text
+    payload = response.content
+    if payload[:2] == b"\x1f\x8b":
+        payload = gzip.decompress(payload)
+    labels = np.frombuffer(payload, dtype=np.uint8).reshape(24, 24, 24)
+    assert int(labels[0, 0, 0]) == 0
+    assert int(labels[8, 8, 8]) == 1
+    bare = fixture_case()
+    (image_directory(bare) / "reference.nii.gz").unlink()
+    refused = admin.get(f"/api/studies/{assigned(admin, bare)}/segmentation")
+    assert refused.status_code == 404
 
 
 def test_follow_numbers_one_liver_lesion_across_dates_and_skips_a_bare_exam(clients, monkeypatch):

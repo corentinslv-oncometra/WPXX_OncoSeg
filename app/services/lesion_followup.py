@@ -1,14 +1,17 @@
-"""Number one patient's liver lesions from the exams Détecter has already finished.
+"""Number one patient's lesions from the exams Détecter has already finished.
 
 Each opened exam keeps image.nii.gz beside the case. Organs and lesions stay in
-the autoseg folder of that series. Dates without both masks are left out. The
-first remaining date is the reference, in folder-name order.
+the autoseg folder of that series. A calendar day contributes one series, the
+portal venous phase when it can be recognized. Dates without both masks are
+left out. The first remaining date is the reference, in folder-name order.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import re
 import threading
 import time
 
@@ -117,7 +120,9 @@ def _worker(token: str, exams: list[Exam], skipped: list[str], omitted: list[str
     try:
         result = track(exams, report=report)
         report(96, "Écriture du suivi…")
-        write_result(result, exams, _tracking_dir(token))
+        with _lock:
+            if (_jobs.get(token) or {}).get("state") == "running":
+                write_result(result, exams, _tracking_dir(token))
         _finish(token, {
             "state": "done",
             "detail": _done_detail(result, skipped, omitted or []),
@@ -207,6 +212,13 @@ def tracking_folder(case_id: str) -> Path:
     return _tracking_dir(_token_for(case_id))
 
 
+def followup_running(case_id: str) -> bool:
+    """True while Suivre is still writing this patient's numbers."""
+    token = _token_for(case_id)
+    with _lock:
+        return (_jobs.get(token) or {}).get("state") == "running"
+
+
 def patient_timeline(case_id: str) -> list[dict]:
     """Every opened exam of this patient, in folder order, with its display date."""
     from app.db import SessionLocal
@@ -247,21 +259,119 @@ def _sort_key(case) -> tuple:
     return (str(source.get("local_timepoint") or source.get("visit") or ""), str(case.patient_id), stamp)
 
 
+# One series per calendar day. Portal venous is the phase used to measure lesion volume.
+_PORTAL = 4
+_ARTERIAL = 3
+_CONTRAST = 2
+_DELAYED = 1
+_NONCONTRAST = 0
+_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_TOKEN_C = re.compile(r"(^|[^A-Z])C([^A-Z]|$)")
+
+
 def select_followup_cases(cases: list) -> tuple[list, list[str]]:
-    """One row per contrast series. A non-contrast series yields when that day has another series."""
+    """One series per calendar day: the phase most suitable for measuring a lesion."""
     grouped: dict[str, list] = {}
+    order: list[str] = []
     for case in cases:
-        grouped.setdefault(_date_folder(case), []).append(case)
+        day = _calendar_day(case)
+        if day not in grouped:
+            order.append(day)
+            grouped[day] = []
+        grouped[day].append(case)
     kept = []
     omitted = []
-    for case in cases:
-        group = grouped[_date_folder(case)]
-        contrast = [item for item in group if not _is_precontrast(item)]
-        if contrast and all(item is not case for item in contrast):
-            omitted.append(_series_folder(case) or _date_folder(case))
-            continue
-        kept.append(case)
+    for day in order:
+        group = grouped[day]
+        chosen = max(group, key=_adequacy_key)
+        kept.append(chosen)
+        for case in group:
+            if case is not chosen:
+                omitted.append(_series_folder(case) or day)
     return kept, omitted
+
+
+def _adequacy_key(case) -> tuple:
+    source = case.source or {}
+    indexed = 1 if source.get("seg_used") or source.get("tumor_from_seg") else 0
+    return (_phase_rank(case), indexed, _series_folder(case))
+
+
+def _phase_rank(case) -> int:
+    """Portal venous outranks arterial, then any other contrast series, then a plain series."""
+    named = _named_phase(_series_text(case))
+    if named in {_PORTAL, _ARTERIAL, _DELAYED, _NONCONTRAST}:
+        return named
+    measured = _enhancement_rank(case)
+    if measured is not None:
+        return measured
+    if named is not None:
+        return named
+    return _NONCONTRAST
+
+
+def _named_phase(text: str) -> int | None:
+    folded = text.upper()
+    if re.search(r"(^|[^A-Z])PRE([^A-Z]|$)", folded) or "NONCON" in folded or "W/O" in folded or "WITHOUT" in folded:
+        return _NONCONTRAST
+    if "ARTERIAL" in folded or "LATE ART" in folded or re.search(r"(^|[^A-Z])ART([^A-Z]|$)", folded):
+        return _ARTERIAL
+    if "PORTAL" in folded or re.search(r"(^|[^A-Z])VENOUS([^A-Z]|$)", folded) or "PVP" in folded:
+        return _PORTAL
+    if "DELAY" in folded or "EQUILIBRIUM" in folded:
+        return _DELAYED
+    if "C-A-P" in folded or "PHASE" in folded or "CONTRAST" in folded or "W/C" in folded or _TOKEN_C.search(folded):
+        return _CONTRAST
+    return None
+
+
+def _enhancement_rank(case) -> int | None:
+    """Classify an unnamed series from the aorta, the portal vein and the liver."""
+    source = case.source or {}
+    uid = str(source.get("series_instance_uid") or "")
+    if not uid:
+        return None
+    table = series_result_dir(uid) / "hu.json"
+    if not table.is_file():
+        return None
+    try:
+        payload = json.loads(table.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    means = {
+        str(row.get("name")): row.get("hu_mean")
+        for row in payload.get("organs") or []
+        if isinstance(row, dict)
+    }
+    aorta, portal, liver = means.get("aorta"), means.get("portal_vein_and_splenic_vein"), means.get("liver")
+    if not all(isinstance(value, (int, float)) for value in (aorta, portal, liver)):
+        return None
+    return _rank_from_enhancement(float(aorta), float(portal), float(liver))
+
+
+def _rank_from_enhancement(aorta: float, portal: float, liver: float) -> int:
+    if aorta < 90 and portal < 80 and liver < 80:
+        return _NONCONTRAST
+    if portal >= 120 and portal + 20 >= aorta and liver >= 80:
+        return _PORTAL
+    if aorta >= 150 and aorta - portal >= 80 and portal < 130:
+        return _ARTERIAL
+    if aorta >= 120 or portal >= 100:
+        return _CONTRAST
+    return _NONCONTRAST
+
+
+def _calendar_day(case) -> str:
+    folder = _date_folder(case)
+    match = _DATE.search(folder)
+    if match:
+        return match.group(0)
+    return folder
+
+
+def _series_text(case) -> str:
+    source = case.source or {}
+    return f"{_series_folder(case)} {source.get('sequence') or ''}"
 
 
 def _path_parts(case) -> list[str]:
@@ -284,10 +394,6 @@ def _series_folder(case) -> str:
     return ""
 
 
-def _is_precontrast(case) -> bool:
-    return "PRE" in _series_folder(case).upper()
-
-
 def _time_label(case) -> str:
     return _date_folder(case)
 
@@ -307,7 +413,7 @@ def _done_detail(result, skipped: list[str], omitted: list[str] | None = None) -
     if skipped:
         text += f" {_plural(len(skipped), 'examen ignoré', 'examens ignorés')}, sans détection."
     if omitted:
-        text += f" {_plural(len(omitted), 'série sans contraste ignorée', 'séries sans contraste ignorées')}."
+        text += f" {_plural(len(omitted), 'autre série du même jour écartée', 'autres séries du même jour écartées')}."
     return text
 
 

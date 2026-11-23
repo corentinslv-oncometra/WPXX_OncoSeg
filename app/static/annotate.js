@@ -1,9 +1,9 @@
 import {collectDirectoryEntries, classifyFiles, hiddenPath} from '/import-files.mjs?v=dicom-import-1';
 import {PLANE_AXES, zoomTransform, wheelPixels, nextFocus, isTextEditing, UndoQueue, ViewerFullscreen} from '/viewer-controls.mjs?v=fullscreen-1';
 import {workflowState, STATUS_LABELS} from '/annotation-workflow.mjs?v=nodules-1';
-import {jobNoduleLabel, selectedNodule, proposalIsCurrent, previewLabel} from '/nodule-controls.mjs?v=nodules-1';
+import {jobNoduleLabel, selectedNodule} from '/nodule-controls.mjs?v=nodules-1';
 import {DIAMETER_PRESETS, createEditSettings, normalizeDiameter, strokeSpec, sphereSectionRadius} from '/mask-editing.mjs?v=mask-tools-1';
-import {createLongitudinal} from '/assets/longitudinal.mjs?v=follow-4';
+import {createLongitudinal} from '/assets/longitudinal.mjs?v=follow-13';
 
 const $ = (id) => document.getElementById(id);
 const embedded = new URLSearchParams(location.search).get('embedded') === '1';
@@ -140,7 +140,7 @@ async function openCase(id) {
   await flushPendingPoint();
   undoQueue.clear();
   const epoch = ++state.epoch; state.loading = true; clearTimeout(pollTimer);
-  state.id = id; state.meta = null; state.segmentationFile = false; state.volume = null; state.mask = null; state.proposal = null;
+  state.id = id; state.meta = null; state.segmentationFile = false; state.volume = null; state.mask = null; state.reference = null; state.proposal = null;
   state.preview = false; state.box = null; state.job = null; state.undo = []; state.brushHover = null;
   state.jobs = []; state.runningJobId = null; state.selectedNodule = null;
   state.organs = null; state.organColors = {}; state.organNames = {}; state.soloOrgan = null;
@@ -181,6 +181,7 @@ async function openCase(id) {
     if (head) state.undo = [head.parent_id];
     $("viewer-empty").hidden = true;
     loadOrgans().catch(() => {});
+    loadReference().catch(() => {});
     history.replaceState({}, "", `/viewer?study_id=${id}${embedded ? '&embedded=1' : ''}`);
     state.runningJobId = null;
   } catch (error) {
@@ -225,23 +226,28 @@ function renderLesionDice() {
   node.textContent = `Score Dice ${state.lesionDice.toLocaleString("fr-FR", {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
 }
 const ORGAN_BOX_GREEN = "#39FF14";
-function lesionLabels() {
-  const labels = new Set();
-  for (const nodule of state.meta?.nodules || []) {
-    const name = (nodule.name || "").toLowerCase();
-    if (isRecordedTumor(nodule) || name.includes("lesion") || name.includes("tumeur") || name.includes("tumor")) labels.add(nodule.label);
-  }
-  return labels;
+async function loadReference() {
+  state.reference = null;
+  if (!state.id || !state.volume || !state.segmentationFile) return;
+  let response;
+  try { response = await api(`/api/studies/${state.id}/segmentation`); }
+  catch (error) { if (error.status === 404) return; throw error; }
+  const labels = new Uint8Array(await response.arrayBuffer());
+  if (!state.volume || labels.length !== state.volume.length) return;
+  state.reference = labels;
+  state.displayVersion++;
+  updateTumorMarks();
+  updateOrganBox();
+  requestRender();
 }
 function updateOrganBox() {
-  state.organBox = null;
+  state.organBoxes = [];
   if (!state.organs || !state.meta) return;
   const [xSize, ySize, zSize] = state.meta.size_xyz;
   const organs = state.organs;
-  const mask = state.mask;
-  const lesions = lesionLabels();
-  const votes = new Map();
+  const reference = state.reference;
   const neighbors = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  const owners = new Map();
   let seen = 0;
   for (let z = 0; z < zSize; z++) {
     for (let y = 0; y < ySize; y++) {
@@ -249,25 +255,30 @@ function updateOrganBox() {
       for (let x = 0; x < xSize; x++) {
         const index = row + x;
         const aiHere = state.organVisible && organs[index] === 65000;
-        const segHere = state.segmentationFile && state.overlay && mask && lesions.has(mask[index]);
+        const segHere = state.overlay && reference && reference[index] > 0;
         if (!(aiHere || segHere)) continue;
         if ((seen++ % 4) !== 0) continue;
-        const here = organs[index];
-        if (here && here !== 65000) votes.set(here, (votes.get(here) || 0) + 4);
-        for (const [dx, dy, dz] of neighbors) {
-          const nx = x + dx, ny = y + dy, nz = z + dz;
-          if (nx < 0 || ny < 0 || nz < 0 || nx >= xSize || ny >= ySize || nz >= zSize) continue;
-          const organ = organs[offset(nx, ny, nz)];
-          if (!organ || organ === 65000) continue;
-          votes.set(organ, (votes.get(organ) || 0) + 1);
+        let owner = organs[index];
+        if (!owner || owner === 65000) {
+          const around = new Map();
+          for (const [dx, dy, dz] of neighbors) {
+            const nx = x + dx, ny = y + dy, nz = z + dz;
+            if (nx < 0 || ny < 0 || nz < 0 || nx >= xSize || ny >= ySize || nz >= zSize) continue;
+            const organ = organs[offset(nx, ny, nz)];
+            if (!organ || organ === 65000) continue;
+            around.set(organ, (around.get(organ) || 0) + 1);
+          }
+          owner = 0;
+          let best = 0;
+          for (const [label, count] of around) if (count > best) { owner = label; best = count; }
         }
+        if (owner) owners.set(owner, (owners.get(owner) || 0) + 1);
       }
     }
   }
-  if (!votes.size) return;
-  let organ = 0, best = 0;
-  for (const [label, count] of votes) if (count > best) { organ = label; best = count; }
-  state.organBox = {label: organ, name: state.organNames?.[organ] || "Organe"};
+  state.organBoxes = [...owners.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([label]) => ({label, name: state.organNames?.[label] || "Organe"}));
 }
 function isRecordedTumor(nodule) {
   const name = (nodule.name || "").toLowerCase();
@@ -285,15 +296,14 @@ function updateTumorMarks() {
   if (!state.meta || !state.volume) {boxes.forEach((box) => box && box.replaceChildren()); return;}
   const [xSize, ySize, zSize] = state.meta.size_xyz;
   const sagittal = new Uint8Array(xSize), coronal = new Uint8Array(ySize), axial = new Uint8Array(zSize);
-  const tumorLabels = new Set((state.meta.nodules || []).filter(isRecordedTumor).map((nodule) => nodule.label));
-  const organs = state.organs, mask = state.mask;
+  const organs = state.organs, reference = state.reference;
   for (let z = 0; z < zSize; z++) {
     for (let y = 0; y < ySize; y++) {
       const row = (z * ySize + y) * xSize;
       for (let x = 0; x < xSize; x++) {
         const index = row + x;
         const aiHere = state.organVisible && organs && organs[index] === 65000;
-        const segHere = state.segmentationFile && state.overlay && mask && tumorLabels.has(mask[index]);
+        const segHere = state.overlay && reference && reference[index] > 0;
         if (!(aiHere || segHere)) continue;
         sagittal[x] = 1; coronal[y] = 1; axial[z] = 1;
       }
@@ -492,6 +502,22 @@ const longitudinal = createLongitudinal({
     document.body.classList.toggle('longitudinal-mode', active);
     if (embedded) parent.postMessage({type: 'oncometra:longitudinal-state', active}, location.origin);
   },
+  onError: handle,
+  onRenumber: async (lesionId, number) => {
+    const path = `/api/studies/${state.id}/longitudinal/number`;
+    let bundle;
+    try {
+      bundle = await post(path, {lesion_id: lesionId, number, swap: false});
+    } catch (error) {
+      if (error.status !== 409) throw error;
+      if (!window.confirm(error.message)) return null;
+      bundle = await post(path, {lesion_id: lesionId, number, swap: true});
+    }
+    const change = bundle.renumber;
+    if (change?.swapped) notify(`N${change.from} et N${change.to} ont été échangés pour toutes les dates.`);
+    else if (change) notify(`N${change.from} est devenu N${change.to} pour toutes les dates.`);
+    return bundle;
+  },
 });
 function requestRender() {
   if (renderPending) return;
@@ -525,12 +551,8 @@ function renderView(view) {
   const slice = state.cross[normal];
   view.slider.max = state.meta.size_xyz[normal] - 1; view.slider.value = slice;
   const source = view.bitmap;
-  const overlay = state.preview ? state.proposal : state.mask;
-  const targetLabel = state.preview ? jobNoduleLabel(state.job) : null;
-  const colors = {...state.noduleColors, 256: [255, 102, 94], 257: [245, 186, 85]};
   const tumorRed = [220, 0, 0];
   const aiCyan = [0, 188, 255];
-  const tumorLabels = new Set((state.meta?.nodules || []).filter(isRecordedTumor).map((nodule) => nodule.label));
   const opacityControl = $("overlay-opacity");
   if (opacityControl && opacityControl.dataset.lesionsOpaque !== "1") {
     opacityControl.max = "1";
@@ -539,10 +561,11 @@ function renderView(view) {
   }
   const opacity = state.overlay ? Number(opacityControl.value) : 0;
   const low = state.window.level - state.window.width / 2;
-  const outlineOrgan = state.organBox?.label || 0;
-  const rasterKey = [state.volume, state.mask, overlay, opacity, low, state.window.width, slice,
-    state.preview, targetLabel, state.selectedNodule, state.displayVersion, signX, signY,
-    state.organs, state.soloOrgan, state.organVisible, state.segmentationFile, outlineOrgan];
+  const boxes = state.organBoxes || [];
+  const outlineKey = boxes.map((item) => item.label).join(",");
+  const rasterKey = [state.volume, opacity, low, state.window.width, slice,
+    state.displayVersion, signX, signY,
+    state.organs, state.soloOrgan, state.organVisible, state.segmentationFile, state.reference, outlineKey];
   // Zoom, pan and crosshair changes reuse the raster instead of windowing every voxel again.
   if (!view.rasterKey || rasterKey.some((value, i) => value !== view.rasterKey[i])) {
     source.width = width; source.height = height;
@@ -550,24 +573,22 @@ function renderView(view) {
     lesions.width = width; lesions.height = height;
     const bctx = source.getContext("2d"); const pixels = bctx.createImageData(width, height);
     const lctx = lesions.getContext("2d"); const lesionPixels = lctx.createImageData(width, height);
-    const outline = [];
+    const outlines = new Map(boxes.map((item) => [item.label, {name: item.name, points: []}]));
     const volumeSize = state.meta.size_xyz;
     for (let v = 0; v < height; v++) for (let u = 0; u < width; u++) {
       let x, y, z; const nativeU = displayX(u), nativeV = displayY(v);
       if (normal === 2) {x = nativeU; y = nativeV; z = slice;} else if (normal === 1) {x = nativeU; y = slice; z = nativeV;} else {x = slice; y = nativeU; z = nativeV;}
       const index = offset(x, y, z), p = (v * width + u) * 4;
       const value = Math.max(0, Math.min(255, (state.volume[index] - low) * 255 / state.window.width));
-      const label = previewLabel(state.mask?.[index] || 0, state.preview && overlay?.[index], targetLabel);
-      const color = tumorLabels.has(label) ? tumorRed : (colors[label] || [104, 237, 182]);
       const organ = state.organs ? state.organs[index] : 0;
       const organIsTumor = organ === 65000;
       const showOrgan = state.organVisible && organ && !organIsTumor && (!state.soloOrgan || organ === state.soloOrgan);
       const showAi = state.organVisible && organIsTumor && (!state.soloOrgan || state.soloOrgan === 65000);
-      const showSeg = Boolean(state.segmentationFile && state.overlay && label && !state.hiddenNodules.has(label) && opacity > 0);
+      const showSeg = Boolean(state.overlay && state.reference && state.reference[index] > 0 && opacity > 0);
       let lesionColor = null;
       if (showAi && showSeg) lesionColor = aiCyan.map((channel, i) => Math.round((channel + color[i]) / 2));
       else if (showAi) lesionColor = aiCyan;
-      else if (showSeg) lesionColor = color;
+      else if (showSeg) lesionColor = tumorRed;
       let red = value, green = value, blue = value;
       const organColor = showOrgan && !organIsTumor ? state.organColors[organ] : null;
       const organAlpha = organColor ? (state.soloOrgan ? .62 : .42) : 0;
@@ -585,7 +606,8 @@ function renderView(view) {
         lesionPixels.data[p + 2] = lesionColor[2];
         lesionPixels.data[p + 3] = Math.round(cover * 255);
       }
-      if (outlineOrgan && organ === outlineOrgan) {
+      const marked = outlines.get(organ);
+      if (marked) {
         let edge = false;
         for (const [da, db] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
           let nx = x, ny = y, nz = z;
@@ -593,14 +615,14 @@ function renderView(view) {
           if (b === 0) nx += db; else if (b === 1) ny += db; else nz += db;
           const outside = nx < 0 || ny < 0 || nz < 0 || nx >= volumeSize[0] || ny >= volumeSize[1] || nz >= volumeSize[2];
           const neighbor = outside ? 0 : state.organs[offset(nx, ny, nz)];
-          if (outside || (neighbor !== outlineOrgan && neighbor !== 65000)) { edge = true; break; }
+          if (outside || (neighbor !== organ && neighbor !== 65000)) { edge = true; break; }
         }
-        if (edge) outline.push(u, v);
+        if (edge) marked.points.push(u, v);
       }
     }
     bctx.putImageData(pixels, 0, 0);
     lctx.putImageData(lesionPixels, 0, 0);
-    view.organOutline = outline;
+    view.organOutlines = [...outlines.values()];
     view.rasterKey = rasterKey;
   }
   const sx = state.meta.spacing_xyz[a], sy = state.meta.spacing_xyz[b];
@@ -612,26 +634,28 @@ function renderView(view) {
   ctx.imageSmoothingEnabled = false; ctx.drawImage(view.lesions, left, top, dw, dh);
   const cx = left + (displayX(state.cross[a]) + .5) * dw / width, cy = top + (displayY(state.cross[b]) + .5) * dh / height;
   ctx.save(); ctx.beginPath(); ctx.rect(left, top, dw, dh); ctx.clip();
-  const outline = view.organOutline;
-  if (outline?.length && state.organBox && state.organVisible) {
+  const drawn = (view.organOutlines || []).filter((item) => item.points.length);
+  if (drawn.length && state.organVisible) {
     const px = dw / width, py = dh / height;
     const radius = Math.max(px, py) * (view.plane === "axial" ? 2.4 : 0.85);
     ctx.save();
     ctx.globalAlpha = 1;
     ctx.fillStyle = ORGAN_BOX_GREEN;
-    ctx.beginPath();
-    let labelU = outline[0], labelV = outline[1];
-    for (let i = 0; i < outline.length; i += 2) {
-      const u = outline[i], v = outline[i + 1];
-      const x = left + (u + .5) * px, y = top + (v + .5) * py;
-      ctx.moveTo(x + radius, y);
-      ctx.arc(x, y, radius, 0, Math.PI * 2);
-      if (v < labelV) { labelU = u; labelV = v; }
-    }
-    ctx.fill();
     ctx.font = "700 12px sans-serif";
     ctx.textAlign = "left";
-    ctx.fillText(state.organBox.name, left + (labelU + .5) * px + radius + 4, top + (labelV + .5) * py);
+    for (const item of drawn) {
+      ctx.beginPath();
+      let labelU = item.points[0], labelV = item.points[1];
+      for (let i = 0; i < item.points.length; i += 2) {
+        const u = item.points[i], v = item.points[i + 1];
+        const x = left + (u + .5) * px, y = top + (v + .5) * py;
+        ctx.moveTo(x + radius, y);
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        if (v < labelV) { labelU = u; labelV = v; }
+      }
+      ctx.fill();
+      ctx.fillText(item.name, left + (labelU + .5) * px + radius + 4, top + (labelV + .5) * py);
+    }
     ctx.restore();
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(view.lesions, left, top, dw, dh);

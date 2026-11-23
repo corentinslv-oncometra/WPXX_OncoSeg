@@ -49,6 +49,8 @@ body.longitudinal-mode #follow-inspector{display:flex}
 .lesion-cards{display:flex;flex-direction:column;gap:10px}
 .lesion-card{border:1px solid #24343a;border-left-width:4px;border-radius:8px;padding:10px;background:#10181c;color:#d5e2e4}
 .lesion-card header{display:flex;align-items:center;gap:8px;font-size:14px}
+.lesion-number{display:inline-flex;align-items:center;gap:2px;font-weight:700}
+.lesion-number input{width:3.4em;margin:0;padding:1px 4px;border:1px solid #345058;border-radius:4px;background:#0c1418;color:#fff;font:inherit;font-variant-numeric:tabular-nums}
 .lesion-card .delta{margin-left:auto;font-variant-numeric:tabular-nums}
 .lesion-when{margin-top:8px}
 .lesion-when h3{margin:0 0 4px;font-size:12px;color:#9fb4b8;font-weight:650}

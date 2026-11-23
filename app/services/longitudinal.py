@@ -1,4 +1,4 @@
-"""Side-by-side liver follow-up for one patient.
+"""Side-by-side lesion follow-up for one patient.
 
 The tracking file already numbers lesions. This module adds the geometry the
 viewer needs: the axial slice at the centre of each lesion, and a rigid Z
@@ -8,16 +8,23 @@ shift that puts every date into the baseline coordinate system.
 from __future__ import annotations
 
 import json
+import os
 
 import numpy as np
 import SimpleITK as sitk
 
-from app.services.lesion_followup import patient_timeline, tracking_folder
+from app.services.lesion_followup import followup_running, patient_timeline, tracking_folder
 from app.services.lesion_tracking import LesionTrackingError, _safe_name
+
+_MAX_LESION_NUMBER = 65535
 
 
 class LongitudinalError(LesionTrackingError):
     pass
+
+
+class NumberSwapRequired(LongitudinalError):
+    """The requested number already belongs to another lesion. The caller must confirm the exchange."""
 
 
 def native_z_mm(slice_index: int, origin_z: float, spacing_z: float, direction_zz: float) -> float:
@@ -65,26 +72,41 @@ def lesion_centers(labels: np.ndarray, origin, spacing, direction) -> list[dict]
 
 
 def evolution_rows(records: list[dict], times: list[str]) -> list[dict]:
-    """One row per lesion: status at the last date, volume at every date, change from the first."""
+    """One row per lesion. The percentage is that lesion's own change at the last exam."""
     rows = []
     lesion_ids = sorted({int(record["lesion_id"]) for record in records})
     for lesion_id in lesion_ids:
         by_time = {record["time_id"]: record for record in records if int(record["lesion_id"]) == lesion_id}
         volumes = {time_id: None if by_time.get(time_id) is None else by_time[time_id].get("volume_cm3") for time_id in times}
-        first = volumes.get(times[0]) if times else None
-        last = volumes.get(times[-1]) if times else None
-        delta = None
-        if first not in (None, 0) and last is not None:
-            delta = round((float(last) - float(first)) / float(first) * 100.0, 1)
         latest = by_time.get(times[-1]) if times else None
+        origin = next((by_time[time_id] for time_id in times if time_id in by_time), None)
         rows.append({
             "lesion_id": lesion_id,
             "status": None if latest is None else latest.get("status"),
             "volumes": volumes,
-            "delta_percent": delta,
+            "delta_percent": _lesion_delta(volumes, times),
+            "event": None if origin is None else origin.get("event"),
+            "parent_ids": [] if origin is None else list(origin.get("parent_ids") or []),
             "measures": {time_id: _measure(by_time.get(time_id)) for time_id in times},
         })
     return rows
+
+
+def _lesion_delta(volumes: dict, times: list[str]) -> float | None:
+    """Signed change of this lesion from its previous volume to the last exam."""
+    if len(times) < 2:
+        return None
+    last = volumes.get(times[-1])
+    last_value = 0.0 if not isinstance(last, (int, float)) else float(last)
+    reference = None
+    for time_id in reversed(times[:-1]):
+        value = volumes.get(time_id)
+        if isinstance(value, (int, float)) and float(value) > 0:
+            reference = float(value)
+            break
+    if reference is None:
+        return None
+    return round((last_value - reference) / reference * 100.0, 1)
 
 
 def _measure(record: dict | None) -> dict | None:
@@ -147,6 +169,110 @@ def longitudinal_bundle(case_id: str, user_id: str) -> dict:
         "dates": dates,
         "rows": evolution_rows(records, [item["time_id"] for item in dates]),
     }
+
+
+def number_mapping(known: set[int], source: int, target: int, *, swap: bool) -> dict[int, int]:
+    """Rename one identity, or exchange it with another. The result is a permutation, never a merge."""
+    if source < 1 or target < 1 or source > _MAX_LESION_NUMBER or target > _MAX_LESION_NUMBER:
+        raise LongitudinalError(f"Le numéro doit être un entier entre 1 et {_MAX_LESION_NUMBER}.")
+    if source not in known:
+        raise LongitudinalError(f"Le numéro {source} n’est pas dans ce suivi.")
+    if source == target:
+        return {}
+    if target in known and not swap:
+        raise NumberSwapRequired(f"N{target} est déjà une lésion. Échanger N{source} et N{target} pour toutes les dates ?")
+    if target in known:
+        return {source: target, target: source}
+    return {source: target}
+
+
+def apply_id_map(labels: np.ndarray, mapping: dict[int, int]) -> np.ndarray:
+    """Apply a permutation to label voxels. Each voxel is read from the original number."""
+    if not mapping:
+        return np.asarray(labels)
+    source = np.asarray(labels)
+    if source.size and int(source.max()) > _MAX_LESION_NUMBER:
+        raise LongitudinalError("Un masque contient un numéro trop grand.")
+    table = np.arange(_MAX_LESION_NUMBER + 1, dtype=np.uint16)
+    for old, new in mapping.items():
+        table[int(old)] = np.uint16(new)
+    return table[source.astype(np.uint16, copy=False)]
+
+
+def remap_records(records: list[dict], mapping: dict[int, int]) -> list[dict]:
+    """Move every record and every parent or child reference with the same permutation."""
+    if not mapping:
+        return records
+    remapped = []
+    for record in records:
+        item = dict(record)
+        item["lesion_id"] = mapping.get(int(item["lesion_id"]), int(item["lesion_id"]))
+        item["parent_ids"] = [mapping.get(int(value), int(value)) for value in item.get("parent_ids") or []]
+        item["child_ids"] = [mapping.get(int(value), int(value)) for value in item.get("child_ids") or []]
+        remapped.append(item)
+    return remapped
+
+
+def commit_number_change(folder, source: int, target: int, *, swap: bool) -> bool:
+    """Rewrite tracking.json and every date mask. Returns True when two numbers were exchanged."""
+    path = folder / "tracking.json"
+    if not path.is_file():
+        raise LongitudinalError("Aucun suivi enregistré pour ce patient.")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    records = list(payload.get("lesions") or [])
+    known = {int(record["lesion_id"]) for record in records}
+    loaded = []
+    for time_id in _tracked_times(payload, records):
+        label_path = folder / f"{_safe_name(time_id)}.nii.gz"
+        if not label_path.is_file():
+            continue
+        image = sitk.ReadImage(str(label_path))
+        array = np.rint(sitk.GetArrayFromImage(image)).astype(np.uint16)
+        known.update(int(value) for value in np.unique(array) if int(value) > 0)
+        loaded.append((label_path, image, array))
+    mapping = number_mapping(known, int(source), int(target), swap=swap)
+    if not mapping:
+        return False
+    payload["lesions"] = remap_records(records, mapping)
+    payload["number_changes"] = [*list(payload.get("number_changes") or []), {
+        "from": int(source), "to": int(target), "swapped": target in known and int(source) != int(target),
+    }][-20:]
+    pending = []
+    try:
+        for label_path, image, array in loaded:
+            changed = sitk.GetImageFromArray(apply_id_map(array, mapping))
+            changed.CopyInformation(image)
+            temporary = label_path.with_name(f".{label_path.name}.renumber.nii.gz")
+            sitk.WriteImage(changed, str(temporary), True)
+            pending.append(temporary)
+        temporary_json = folder / ".tracking.json.renumber"
+        temporary_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        pending.append(temporary_json)
+        for label_path, _image, _array in loaded:
+            os.replace(label_path.with_name(f".{label_path.name}.renumber.nii.gz"), label_path)
+        os.replace(temporary_json, path)
+        pending.clear()
+    finally:
+        for temporary in pending:
+            temporary.unlink(missing_ok=True)
+    return bool(mapping.get(int(source)) == int(target) and mapping.get(int(target)) == int(source))
+
+
+def renumber_lesion(case_id: str, user_id: str, source: int, target: int, *, swap: bool) -> dict:
+    """Change one lesion number for the whole follow-up and return the viewer bundle."""
+    if followup_running(case_id):
+        raise LongitudinalError("Un calcul de suivi est en cours. Le numéro pourra être modifié quand il sera terminé.")
+    swapped = commit_number_change(tracking_folder(case_id), source, target, swap=swap)
+    bundle = longitudinal_bundle(case_id, user_id)
+    bundle["renumber"] = {"from": int(source), "to": int(target), "swapped": swapped}
+    return bundle
+
+
+def _tracked_times(payload: dict, records: list[dict]) -> list[str]:
+    times = [str(time_id) for time_id in payload.get("times") or []]
+    if times:
+        return times
+    return sorted({str(record.get("time_id")) for record in records if record.get("time_id")})
 
 
 def label_volume(case_id: str, time_id: str) -> np.ndarray:

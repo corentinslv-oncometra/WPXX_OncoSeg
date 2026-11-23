@@ -194,22 +194,49 @@ def image_directory(case):
 
 
 def _seed_tumor_overlay(db, study_id, reference: Path, user):
-    """Show the DICOM SEG tumor in the mask layer. An AI lesion is never copied here."""
-    from app.services.nodules import new_nodule
+    """Add the folder segmentation to the lesion column without replacing another lesion."""
+    from fastapi import HTTPException
+    from app.models import AnnotationRevision
+    from app.services.nodules import MAX_NODULE_LABEL, new_nodule
     if not reference.is_file():
         return
     head = db.get(AnnotationHead, study_id)
-    if head is None or head.revision_id:
+    if head is None:
         return
-    image = lung.image_for(study_id)
-    mask = sitk.GetArrayFromImage(sitk.ReadImage(str(reference))).astype(np.uint8)
-    if mask.shape != tuple(reversed(image.GetSize())) or not int(mask.sum()):
+    try:
+        lung.check_editable(db, head)
+        image = lung.image_for(study_id)
+    except HTTPException:
         return
-    nodule = new_nodule(1)
+    segment = sitk.GetArrayFromImage(sitk.ReadImage(str(reference))) > 0
+    if segment.shape != tuple(reversed(image.GetSize())) or not int(segment.sum()):
+        return
+    mask = lung.current_mask(head, image)
+    if mask.shape != segment.shape:
+        return
+    if head.revision_id:
+        nodules = lung.nodules_for(db, head)
+        if any(item.get("name") == "Tumeur" for item in nodules):
+            return
+        revision = db.get(AnnotationRevision, head.revision_id)
+        used = [int(item["label"]) for item in nodules]
+        if revision is not None:
+            used.append(int((revision.details or {}).get("max_nodule_label") or 0))
+        label = max(used, default=0) + 1
+        if label > MAX_NODULE_LABEL:
+            return
+    else:
+        nodules = []
+        label = 1
+    nodule = new_nodule(label)
     nodule["name"] = "Tumeur"
     nodule["color"] = [220, 38, 38]
+    painted = segment & ((mask == 0) | (mask == label))
+    if int(painted.sum()):
+        mask[painted] = np.uint8(label)
     db.info["annotation_actor"] = user_payload(user)
-    lung.save_revision(db, head, image, mask, "source-segmentation", {"source": "DICOM SEG tumor"}, [nodule])
+    lung.save_revision(db, head, image, mask, "source-segmentation",
+                       {"source": "DICOM SEG tumor", "nodule_label": label}, [*nodules, nodule], changed_nodule=label)
 
 
 def create_assignment(db, case, user, kind="reader", source=None):
@@ -773,6 +800,12 @@ class DetectionStart(BaseModel):
     device: str = ""
 
 
+class LesionNumberChange(BaseModel):
+    lesion_id: int
+    number: int
+    swap: bool = False
+
+
 @app.post("/api/studies/{study_id}/autoseg", status_code=202)
 def start_study_autoseg(study_id: UUID, body: DetectionStart | None = None, user=Depends(current_user)):
     from app.services.exam_autoseg import start_detection
@@ -851,6 +884,39 @@ def study_longitudinal_labels(study_id: UUID, time: str, user=Depends(current_us
     except LongitudinalError as error:
         raise HTTPException(404, str(error)) from error
     return Response(content=gzip.compress(labels.tobytes(), compresslevel=1), media_type="application/octet-stream",
+                    headers={"Content-Encoding": "gzip", "Cache-Control": "no-store"})
+
+
+@app.post("/api/studies/{study_id}/longitudinal/number")
+def study_longitudinal_number(study_id: UUID, body: LesionNumberChange, user=Depends(current_user)):
+    """Give one lesion another number for every date. An occupied number is exchanged, never merged."""
+    from app.services.longitudinal import LongitudinalError, NumberSwapRequired, renumber_lesion
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        case_id = case.id
+    try:
+        return renumber_lesion(case_id, user.id, body.lesion_id, body.number, swap=body.swap)
+    except NumberSwapRequired as error:
+        raise HTTPException(409, str(error)) from error
+    except LongitudinalError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.get("/api/studies/{study_id}/segmentation")
+def study_segmentation(study_id: UUID, user=Depends(current_user)):
+    """The Mask button reads the segmentation file shipped with the exam, never the AI lesion."""
+    from app.services.exam_autoseg import _reference_mask
+    with SessionLocal() as db:
+        _, case = get_assignment(db, study_id, user)
+        folder = image_directory(case)
+        image_path = folder / "image.nii.gz"
+        if not image_path.is_file():
+            raise HTTPException(404, "Cet examen n’a pas de fichier de segmentation.")
+        reference = _reference_mask(folder, sitk.ReadImage(str(image_path)))
+    if reference is None:
+        raise HTTPException(404, "Cet examen n’a pas de fichier de segmentation.")
+    payload = np.ascontiguousarray(reference.astype(np.uint8))
+    return Response(content=gzip.compress(payload.tobytes(), compresslevel=1), media_type="application/octet-stream",
                     headers={"Content-Encoding": "gzip", "Cache-Control": "no-store"})
 
 

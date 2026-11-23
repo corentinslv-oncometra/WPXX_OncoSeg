@@ -94,7 +94,7 @@ def main() -> None:
     sitk.WriteImage(image, str(ct_path), True)
     organs_path = destination / "organs.nii.gz"
     if not organs_path.is_file():
-        _run("total", ct_path, organs_path, fast=True)
+        _run("total", ct_path, organs_path, fast=False)
     names = class_names("total")
     labels = sitk.GetArrayFromImage(on_reference_grid(image, sitk.ReadImage(str(organs_path))))
     spacing = image.GetSpacing()
@@ -123,7 +123,7 @@ def main() -> None:
     payload = {
         "cancer": CANCER,
         "organ_task": "total",
-        "organ_mode": "fast",
+        "organ_mode": "full",
         "device": "cpu",
         "tumor_task": tumor_task,
         "tumor_note": tumor_note,

@@ -21,7 +21,7 @@ function escapeText(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[character]));
 }
 
-export function createLongitudinal({view, inspector, windowing, loadVolume, loadLabels, onChange}) {
+export function createLongitudinal({view, inspector, windowing, loadVolume, loadLabels, onChange, onRenumber, onError}) {
   let active = false;
   let dates = [];
   let rows = [];
@@ -112,16 +112,68 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
 
   function move(date, slice) {
     const depth = date.size_xyz[2];
-    const next = Math.max(0, Math.min(depth - 1, slice));
-    align(nativeZ(next, date) + date.shift_mm);
-    date.slice = next;
-    redraw();
+    date.slice = Math.max(0, Math.min(depth - 1, slice));
+    paint(date);
   }
 
   function renderInspector() {
     const cards = rows.map((row) => lesionCard(row, dates)).join('');
-    inspector.innerHTML = `<h2>Suivi longitudinal</h2><p class="fine-print">Toutes les lésions coupées par la vue sont affichées ensemble. Le défilement aligne les dates sur la position Z recalée.</p><div class="lesion-cards">${cards || '<p class="fine-print">Aucune lésion numérotée.</p>'}</div><canvas id="follow-chart" width="280" height="150" aria-label="Évolution des volumes"></canvas>`;
+    inspector.innerHTML = `<h2>Suivi longitudinal</h2><p class="fine-print">Toutes les lésions coupées par la vue sont affichées ensemble. Chaque barre fait défiler uniquement son examen. Le numéro d’une carte vaut pour toutes les dates.</p><div class="lesion-cards">${cards || '<p class="fine-print">Aucune lésion numérotée.</p>'}</div><canvas id="follow-chart" width="280" height="150" aria-label="Évolution des volumes"></canvas>`;
     drawChart();
+    bindNumbers();
+  }
+
+  function bindNumbers() {
+    inspector.querySelectorAll('.lesion-number input').forEach((input) => {
+      input.addEventListener('wheel', (event) => event.preventDefault(), {passive: false});
+      input.addEventListener('change', () => {
+        submitNumber(input).catch((error) => onError?.(error));
+      });
+    });
+  }
+
+  async function submitNumber(input) {
+    const source = Number(input.dataset.lesion);
+    const target = Number(input.value);
+    if (!Number.isInteger(target) || target < 1 || target > 65535 || target === source) {
+      input.value = String(source);
+      return;
+    }
+    input.disabled = true;
+    try {
+      const bundle = await onRenumber?.(source, target);
+      if (!bundle || !active) {
+        input.value = String(source);
+        input.disabled = false;
+        return;
+      }
+      await replace(bundle);
+    } catch (error) {
+      input.value = String(source);
+      input.disabled = false;
+      throw error;
+    }
+  }
+
+  async function replace(bundle) {
+    rows = bundle.rows || [];
+    const slices = new Map(dates.map((date) => [date.time_id, date.slice]));
+    const byTime = new Map((bundle.dates || []).map((date) => [date.time_id, date]));
+    await Promise.all(dates.map(async (date) => {
+      const fresh = byTime.get(date.time_id);
+      if (fresh) {
+        date.shift_mm = fresh.shift_mm;
+        date.lesions = fresh.lesions;
+      }
+      const labels = await loadLabels(date.time_id);
+      if (!active) return;
+      date.labels = labels.length === date.volume.length ? labels : null;
+      date.rasterKey = null;
+      date.slice = slices.get(date.time_id) ?? date.slice;
+    }));
+    if (!active) return;
+    renderInspector();
+    redraw();
   }
 
   function drawChart() {
@@ -247,28 +299,18 @@ function markVisibleLesions(ctx, date, left, top, scale) {
   const [width, height] = date.size_xyz;
   const base = date.slice * height * width;
   const signX = date.direction[0] < 0 ? -1 : 1;
-  const sums = new Map();
-  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-    const sourceX = signX < 0 ? width - 1 - x : x;
-    const label = date.labels[base + y * width + sourceX];
-    if (!label) continue;
-    const mark = sums.get(label) || {x: 0, y: 0, count: 0};
-    mark.x += x;
-    mark.y += y;
-    mark.count += 1;
-    sums.set(label, mark);
-  }
+  const parts = sliceParts(date.labels, base, width, height, signX);
   ctx.font = '700 12px sans-serif';
   ctx.textBaseline = 'bottom';
-  for (const [label, mark] of [...sums.entries()].sort((left, right) => left[0] - right[0])) {
-    const color = lesionColor(label);
+  for (const mark of parts.sort((left, right) => left.label - right.label || left.x - right.x)) {
+    const color = lesionColor(mark.label);
     const cx = left + (mark.x / mark.count + 0.5) * date.spacing_xyz[0] * scale;
     const cy = top + (mark.y / mark.count + 0.5) * date.spacing_xyz[1] * scale;
     ctx.beginPath();
     ctx.arc(cx, cy, 4, 0, Math.PI * 2);
     ctx.fillStyle = `rgb(${color.join(',')})`;
     ctx.fill();
-    const name = `N${label}`;
+    const name = `N${mark.label}`;
     ctx.lineWidth = 3;
     ctx.strokeStyle = '#041014';
     ctx.strokeText(name, cx + 6, cy - 4);
@@ -277,17 +319,65 @@ function markVisibleLesions(ctx, date, left, top, scale) {
   }
 }
 
+function sliceParts(labels, base, width, height, signX) {
+  const seen = new Uint8Array(width * height);
+  const parts = [];
+  const stack = [];
+  const source = (x, y) => base + y * width + (signX < 0 ? width - 1 - x : x);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const start = y * width + x;
+    if (seen[start]) continue;
+    const label = labels[source(x, y)];
+    if (!label) continue;
+    seen[start] = 1;
+    stack.push(x, y);
+    let sumX = 0;
+    let sumY = 0;
+    let count = 0;
+    while (stack.length) {
+      const cy = stack.pop();
+      const cx = stack.pop();
+      sumX += cx;
+      sumY += cy;
+      count += 1;
+      const neighbors = [cx - 1, cy, cx + 1, cy, cx, cy - 1, cx, cy + 1];
+      for (let index = 0; index < neighbors.length; index += 2) {
+        const nx = neighbors[index];
+        const ny = neighbors[index + 1];
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const slot = ny * width + nx;
+        if (seen[slot] || labels[source(nx, ny)] !== label) continue;
+        seen[slot] = 1;
+        stack.push(nx, ny);
+      }
+    }
+    parts.push({label, x: sumX, y: sumY, count});
+  }
+  return parts;
+}
+
 function lesionCard(row, dates) {
   const color = lesionColor(row.lesion_id);
   const blocks = dates.map((date) => {
     const measure = row.measures?.[date.time_id];
     const title = escapeText(String(date.time_id).slice(0, 10));
     if (!measure || !measure.volume_cm3) {
-      return `<section class="lesion-when"><h3>${title}</h3><p>Absente</p></section>`;
+      const note = measure && measure.status && measure.status !== 'disparue' ? escapeText(measure.status) : 'Absente';
+      return `<section class="lesion-when"><h3>${title}</h3><p>${note}</p></section>`;
     }
     return `<section class="lesion-when"><h3>${title} · ${escapeText(measure.status || '—')}</h3><dl><dt>Volume</dt><dd>${formatVolume(measure.volume_cm3)} cm³</dd><dt>Grand axe</dt><dd>${formatMm(measure.long_axis_3d_mm)}</dd><dt>Axe axial</dt><dd>${formatMm(measure.long_axis_axial_mm)}</dd><dt>HU moyen</dt><dd>${formatHu(measure.hu_mean)}</dd></dl></section>`;
   }).join('');
-  return `<article class="lesion-card" style="border-color:rgb(${color.join(',')})"><header><span class="long-swatch" style="background:rgb(${color.join(',')})"></span><b>N${row.lesion_id}</b><span class="delta">${formatDelta(row.delta_percent)}</span></header>${blocks}</article>`;
+  const link = lineage(row);
+  return `<article class="lesion-card" style="border-color:rgb(${color.join(',')})"><header><span class="long-swatch" style="background:rgb(${color.join(',')})"></span><label class="lesion-number">N<input type="number" min="1" max="65535" step="1" value="${row.lesion_id}" data-lesion="${row.lesion_id}" aria-label="Numéro de N${row.lesion_id} pour toutes les dates" title="Ce numéro vaut pour toutes les dates"></label>${link ? `<span>${link}</span>` : ''}<span class="delta">${formatDelta(row.delta_percent)}</span></header>${blocks}</article>`;
+}
+
+function lineage(row) {
+  const parents = Array.isArray(row.parent_ids) ? row.parent_ids : [];
+  if (!parents.length) return '';
+  const names = parents.map((id) => `N${id}`).join(' et ');
+  if (row.event === 'division') return `division de ${names}`;
+  if (row.event === 'fusion') return `fusion de ${names}`;
+  return '';
 }
 
 function formatVolume(value) {

@@ -1,10 +1,13 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
+import SimpleITK as sitk
 
-from app.services.lesion_followup import select_followup_cases
+from app.services.lesion_followup import _rank_from_enhancement, select_followup_cases
 from app.services.longitudinal import (
-    _missing_registration, evolution_rows, lesion_centers, native_z_mm, registered_shift, slice_for_registered_z,
+    NumberSwapRequired, _missing_registration, commit_number_change, evolution_rows, lesion_centers,
+    native_z_mm, registered_shift, slice_for_registered_z,
 )
 
 
@@ -30,6 +33,15 @@ def test_centers_use_the_middle_axial_slice_and_evolution_uses_the_first_volume(
     assert rows[0]["status"] == "réponse"
     assert rows[0]["volumes"] == {"t0": 2, "t1": 1}
     assert rows[0]["delta_percent"] == -50
+    own = evolution_rows([
+        {"lesion_id": 1, "time_id": "t0", "status": "nouvelle", "volume_cm3": 8.689},
+        {"lesion_id": 1, "time_id": "t1", "status": "disparue", "volume_cm3": 0},
+        {"lesion_id": 1, "time_id": "t2", "status": "disparue", "volume_cm3": 0},
+        {"lesion_id": 2, "time_id": "t1", "status": "nouvelle", "volume_cm3": 80.531},
+        {"lesion_id": 2, "time_id": "t2", "status": "stable", "volume_cm3": 103.143},
+        {"lesion_id": 3, "time_id": "t2", "status": "nouvelle", "volume_cm3": 0.732},
+    ], ["t0", "t1", "t2"])
+    assert [row["delta_percent"] for row in own] == [-100.0, 28.1, None]
     assert rows[0]["measures"]["t1"]["status"] == "réponse"
     assert rows[0]["measures"]["t1"]["volume_cm3"] == 1
 
@@ -57,7 +69,98 @@ def test_a_precontrast_series_stays_when_it_is_the_only_series_that_day():
     assert omitted == []
 
 
+def test_a_day_keeps_the_portal_phase_and_drops_the_arterial_one():
+    kept, omitted = select_followup_cases([
+        _case("HCC_001/2000-04-21-CT/1-ARTERIAL-1"),
+        _case("HCC_001/2000-04-21-CT/2-PORTAL VENOUS-2"),
+    ])
+    assert [item.source["local_timepoint"] for item in kept] == [
+        "HCC_001/2000-04-21-CT/2-PORTAL VENOUS-2",
+    ]
+    assert omitted == ["1-ARTERIAL-1"]
+
+
+def test_unnamed_phases_are_separated_by_vessel_enhancement():
+    assert _rank_from_enhancement(378.2, 95.4, 72.3) < _rank_from_enhancement(170.8, 195.4, 109.5)
+    assert _rank_from_enhancement(60.1, 34.6, 56.0) < _rank_from_enhancement(378.2, 95.4, 72.3)
+
+
+def test_two_unnamed_series_of_one_day_collapse_to_a_single_exam():
+    kept, omitted = select_followup_cases([
+        _case("HCC_001/2000-04-21-CT/100-46705"),
+        _case("HCC_001/2000-04-21-CT/101-35194"),
+    ])
+    assert len(kept) == 1
+    assert len(omitted) == 1
+
+
+def test_the_series_that_carries_the_segmentation_wins_a_tie():
+    plain = _case("HCC_001/2000-04-21-CT/2-PORTAL-2")
+    indexed = _case("HCC_001/2000-04-21-CT/1-PORTAL-1")
+    indexed.source["tumor_from_seg"] = True
+    kept, omitted = select_followup_cases([plain, indexed])
+    assert kept == [indexed]
+    assert omitted == ["2-PORTAL-2"]
+
+
 def test_tracking_without_a_registered_position_must_be_recomputed():
     assert _missing_registration([{"volume_cm3": 6.1}])
     assert not _missing_registration([{"volume_cm3": 6.1, "registered_z_mm": -95.0}])
     assert not _missing_registration([{"volume_cm3": 0.0}])
+
+
+def _tracking(folder, labels):
+    image = sitk.GetImageFromArray(labels)
+    image.SetSpacing((1.5, 1.5, 5.0))
+    image.SetOrigin((0.0, 0.0, -10.0))
+    sitk.WriteImage(image, str(folder / "t0.nii.gz"), True)
+    payload = {
+        "times": ["t0"],
+        "lesions": [
+            {"lesion_id": 1, "time_id": "t0", "volume_cm3": 1.0, "parent_ids": [], "child_ids": [2]},
+            {"lesion_id": 2, "time_id": "t0", "volume_cm3": 2.0, "parent_ids": [1], "child_ids": [], "event": "division"},
+        ],
+    }
+    (folder / "tracking.json").write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+
+def test_a_free_number_renames_the_lesion_everywhere(tmp_path):
+    labels = np.zeros((2, 2, 2), np.uint16)
+    labels[0, :, :] = 1
+    labels[1, :, :] = 2
+    _tracking(tmp_path, labels)
+    assert commit_number_change(tmp_path, 2, 5, swap=False) is False
+    stored = __import__("json").loads((tmp_path / "tracking.json").read_text(encoding="utf-8"))
+    by_id = {row["lesion_id"]: row for row in stored["lesions"]}
+    assert set(by_id) == {1, 5}
+    assert by_id[1]["child_ids"] == [5]
+    assert by_id[5]["parent_ids"] == [1]
+    written = sitk.GetArrayFromImage(sitk.ReadImage(str(tmp_path / "t0.nii.gz")))
+    assert set(np.unique(written)) == {1, 5}
+    assert int(written[1, 0, 0]) == 5
+    geometry = sitk.ReadImage(str(tmp_path / "t0.nii.gz"))
+    assert geometry.GetSpacing()[2] == 5.0
+
+
+def test_an_occupied_number_is_exchanged_only_after_confirmation(tmp_path):
+    labels = np.zeros((2, 2, 2), np.uint16)
+    labels[0] = 1
+    labels[1] = 2
+    _tracking(tmp_path, labels)
+    with pytest.raises(NumberSwapRequired, match="Échanger N2 et N1"):
+        commit_number_change(tmp_path, 2, 1, swap=False)
+    assert commit_number_change(tmp_path, 2, 1, swap=True) is True
+    written = sitk.GetArrayFromImage(sitk.ReadImage(str(tmp_path / "t0.nii.gz")))
+    assert int(written[0, 0, 0]) == 2
+    assert int(written[1, 0, 0]) == 1
+    stored = __import__("json").loads((tmp_path / "tracking.json").read_text(encoding="utf-8"))
+    by_id = {row["lesion_id"]: row for row in stored["lesions"]}
+    assert by_id[2]["child_ids"] == [1]
+    assert by_id[1]["parent_ids"] == [2]
+    assert stored["number_changes"] == [{"from": 2, "to": 1, "swapped": True}]
+
+
+def test_an_unknown_number_is_refused(tmp_path):
+    _tracking(tmp_path, np.zeros((1, 1, 1), np.uint16))
+    with pytest.raises(Exception, match="n’est pas dans ce suivi"):
+        commit_number_change(tmp_path, 9, 4, swap=False)

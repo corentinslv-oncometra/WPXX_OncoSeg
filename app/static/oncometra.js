@@ -606,7 +606,7 @@ function setFollowMode(active){
   if(!button) return;
   button.classList.toggle('active',active);
   button.setAttribute('aria-pressed',active?'true':'false');
-  button.title=active?'Revenir aux vues axiale, coronale et sagittale.':'Affiche le suivi longitudinal des lésions du foie, une date par panneau.';
+  button.title=active?'Revenir aux vues axiale, coronale et sagittale.':'Affiche le suivi longitudinal des lésions, une date par panneau.';
   setTrackLabel();
 }
 function exitFollowMode(){

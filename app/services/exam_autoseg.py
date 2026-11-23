@@ -48,6 +48,20 @@ def series_result_dir(series_uid: str) -> Path:
     return autoseg_root() / series_uid
 
 
+def _retire_fast_organs(stored: Path) -> None:
+    """Drop a local --fast organ mask so the next run uses the full task."""
+    organs = stored / "organs.nii.gz"
+    table = stored / "hu.json"
+    if not organs.is_file() or not table.is_file():
+        return
+    try:
+        payload = json.loads(table.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if payload.get("organ_mode") == "fast" and payload.get("device") == "cpu":
+        organs.unlink()
+
+
 def segmentation_device() -> str:
     forced = (os.environ.get("ONCOMETRA_TOTALSEG_DEVICE") or os.environ.get("ONCORADAR_TOTALSEG_DEVICE") or "").strip().lower()
     if forced in {"cpu", "gpu", "mps", "kaggle"}:
@@ -464,6 +478,7 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None, device: 
     stored.mkdir(parents=True, exist_ok=True)
     discard_foreign_mask(image_path, stored / "organs.nii.gz")
     discard_foreign_mask(image_path, stored / "lesions.nii.gz")
+    _retire_fast_organs(stored)
     chosen = lesion_task_for_cancer(cancer)
     has_lesions = chosen is not None
     organ_low, organ_high = (4, 46) if has_lesions else (4, 90)
@@ -508,7 +523,7 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None, device: 
     elif remote:
         raise RuntimeError("Le GPU Kaggle n’a pas renvoyé le masque des organes.")
     else:
-        segment(ORGAN_TASK, image_path, organs_path, fast=True, low=organ_low, high=organ_high, detail="Segmentation des organes…")
+        segment(ORGAN_TASK, image_path, organs_path, fast=False, low=organ_low, high=organ_high, detail="Segmentation des organes…")
     names = class_names(ORGAN_TASK)
     labels = sitk.GetArrayFromImage(on_reference_grid(image, sitk.ReadImage(str(organs_path))))
     labels = np.rint(labels).astype(np.uint16)
@@ -585,7 +600,7 @@ def execute_case(case_id: str, study_id: str, runner=None, report=None, device: 
     sitk.WriteImage(volume, str(folder / "organ_labels.nii.gz"), True)
     emit(96, "Calcul des unités Hounsfield…")
     payload = {
-        "cancer": cancer, "organ_task": ORGAN_TASK, "organ_mode": "fast", "device": "kaggle" if remote else "cpu",
+        "cancer": cancer, "organ_task": ORGAN_TASK, "organ_mode": "full", "device": "kaggle" if remote else "cpu",
         "tumor_task": tumor_task, "tumor_note": tumor_note, "dice": dice, "legend": legend,
         "organs": hu_rows(sitk.GetArrayFromImage(image), organ_labels, names, voxel_mm3),
     }

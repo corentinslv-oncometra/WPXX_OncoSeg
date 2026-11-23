@@ -264,12 +264,18 @@ def annotation_state(study_id: UUID, db: Session = Depends(get_db)):
     events = db.execute(select(AnnotationTaskEvent).where(AnnotationTaskEvent.study_id == str(study_id))
                         .order_by(AnnotationTaskEvent.version.desc()).limit(100)).scalars().all()
     status = task_status(head, events[0] if events else None, confirmation)
-    nodules = nodules_for(db, head)
-    current_revision = db.get(AnnotationRevision, head.revision_id) if head.revision_id else None
-    from app.oncometra_models import WorkspaceAssignment, WorkspaceCase
+    from app.oncometra_models import WorkspaceAssignment, WorkspaceCase, WorkspaceUser
     assignment = db.get(WorkspaceAssignment, str(study_id))
     case = db.get(WorkspaceCase, assignment.case_id) if assignment else None
     segmentation_file = bool((case.source or {}).get("tumor_from_seg")) if case else False
+    if segmentation_file and assignment is not None:
+        from app.oncometra import _seed_tumor_overlay, image_directory
+        account = db.get(WorkspaceUser, assignment.user_id)
+        if account is not None:
+            _seed_tumor_overlay(db, str(study_id), image_directory(case) / "reference.nii.gz", account)
+            db.refresh(head)
+    nodules = nodules_for(db, head)
+    current_revision = db.get(AnnotationRevision, head.revision_id) if head.revision_id else None
     return {"study_id": str(study_id), "version": head.version, "revision_id": head.revision_id,
             "segmentation_file": segmentation_file,
             "nodules": nodules, "mask_encoding": "uint8-nodule-labels",

@@ -6,7 +6,8 @@ import pytest
 import SimpleITK as sitk
 
 from app.services.lesion_tracking import (
-    DISPARUE, NOUVELLE, PROGRESSION, REPONSE, STABLE, Exam, LesionTrackingError, LesionView,
+    DISPARUE, DIVISION, FUSION, FUSIONNEE, NOUVELLE, PROGRESSION, REPONSE, STABLE,
+    Exam, LesionTrackingError, LesionView,
     SimpleItkAnatomyRegistrar, assign_lesions, dice, extract_instances, load_exam, make_registrar, track, track_folder,
 )
 
@@ -36,7 +37,7 @@ def _box(shape, origin, size, value=1):
     return mask
 
 
-def test_instances_stay_inside_a_dilated_liver_and_drop_speckles():
+def test_every_lesion_is_kept_and_speckles_are_dropped():
     organs = np.zeros((8, 8, 16), np.int32)
     organs[:, :, 2:7] = 5
     lesions = np.zeros_like(organs)
@@ -45,13 +46,11 @@ def test_instances_stay_inside_a_dilated_liver_and_drop_speckles():
     lesions[0:2, 0:2, 14] = 1
     lesions[0, 0, 6] = 1
     lesions[0, 1, 6] = 1
-    tight = extract_instances(lesions, organs, (1.0, 1.0, 1.0), dilation_mm=0, min_voxels=4)
-    assert np.count_nonzero(tight[:, :, 3:5]) == int(np.count_nonzero(lesions[:, :, 3:5]))
-    assert np.count_nonzero(tight[:, :, 9:]) == 0
-    dilated = extract_instances(lesions, organs, (1.0, 1.0, 1.0), dilation_mm=3.0, min_voxels=4)
-    assert np.count_nonzero(dilated[:, :, 9]) == 4
-    assert np.count_nonzero(dilated[:, :, 14]) == 0
-    assert np.count_nonzero(dilated[:, :, 6]) == 0
+    instances = extract_instances(lesions, organs, (1.0, 1.0, 1.0), min_voxels=4)
+    assert np.count_nonzero(instances[:, :, 3:5]) == int(np.count_nonzero(lesions[:, :, 3:5]))
+    assert np.count_nonzero(instances[:, :, 9]) == 4
+    assert np.count_nonzero(instances[:, :, 14]) == 4
+    assert np.count_nonzero(instances[:, :, 6]) == 0
 
 
 def test_assignment_is_one_to_one_and_honours_both_gates():
@@ -104,7 +103,7 @@ def test_tracking_reports_each_date_before_the_result_is_written():
     assert [percent for percent, _detail in notes] == [8, 49, 92]
     assert "1999-04-30" in notes[0][1]
     assert "1999-06-01" in notes[1][1]
-    assert notes[1][1].startswith("Recalage du foie")
+    assert notes[1][1].startswith("Recalage de l’anatomie")
 
 
 def test_a_lesion_can_leave_and_come_back_with_the_same_number():
@@ -181,10 +180,24 @@ def test_registration_brings_a_shifted_liver_lesion_back():
     assert result.records[-1].status != NOUVELLE
 
 
-def test_a_missing_liver_and_an_unknown_backend_are_rejected():
+def test_a_lesion_outside_the_liver_is_numbered():
+    shape = (8, 8, 16)
+    organs = np.zeros(shape, np.int32)
+    organs[:, :, 12:16] = 12
+    lesion = _box(shape, (2, 2, 12), (3, 3, 3))
+    result = track([_exam("t0", organs, lesion)], registrar=_Identity(), min_voxels=4)
+    assert int(np.count_nonzero(result.labels["t0"])) == int(np.count_nonzero(lesion))
+    assert result.records[0].status == NOUVELLE
+
+
+def test_alignment_needs_an_organ_and_an_unknown_backend_is_rejected():
     organs = np.zeros((4, 4, 4), np.int32)
-    with pytest.raises(LesionTrackingError, match="foie"):
-        track([_exam("t0", organs, organs)], registrar=_Identity())
+    lesion = _box((4, 4, 4), (0, 0, 0), (2, 2, 2))
+    with pytest.raises(LesionTrackingError, match="organe"):
+        track([
+            _exam("t0", organs, lesion),
+            _exam("t1", organs, lesion),
+        ], registrar=SimpleItkAnatomyRegistrar(affine_iterations=1, demons_iterations=0))
     with pytest.raises(LesionTrackingError, match="sitk ou ants"):
         make_registrar("elastix")
 
@@ -199,6 +212,69 @@ def test_ants_reports_a_missing_install():
             make_registrar("ants").warp_labels(_exam("t0", organs, lesions), _exam("t1", organs, lesions), lesions.astype(np.uint16))
     else:
         pytest.skip("antspyx est installé")
+
+
+def test_a_split_keeps_the_same_number_on_both_parts():
+    shape = (4, 4, 24)
+    organs = _liver(shape)
+    parent = _box(shape, (0, 0, 4), (4, 4, 12))
+    left = _box(shape, (0, 0, 4), (4, 4, 5))
+    right = _box(shape, (0, 0, 11), (4, 4, 5))
+    result = track([
+        _exam("t0", organs, parent),
+        _exam("t1", organs, left + right),
+    ], registrar=_Identity(), min_voxels=4)
+    labels = result.labels["t1"]
+    assert set(np.unique(labels)) == {0, 1}
+    assert np.array_equal(labels == 1, (left + right).astype(bool))
+    split_rows = [row for row in result.records if row.time_id == "t1" and row.event == DIVISION]
+    assert [row.lesion_id for row in split_rows] == [1]
+    assert split_rows[0].status == DIVISION
+    assert int(np.count_nonzero(labels == 1)) == int(np.count_nonzero(left)) + int(np.count_nonzero(right))
+
+
+def test_a_speck_inside_a_lesion_does_not_count_as_a_split():
+    shape = (4, 4, 24)
+    organs = _liver(shape)
+    parent = _box(shape, (0, 0, 2), (4, 4, 16))
+    kept = _box(shape, (0, 0, 2), (4, 4, 12))
+    speck = _box(shape, (0, 0, 16), (2, 2, 2))
+    result = track([
+        _exam("t0", organs, parent),
+        _exam("t1", organs, kept + speck),
+    ], registrar=_Identity(), min_voxels=4)
+    assert np.array_equal(result.labels["t1"] == 1, kept.astype(bool))
+    assert set(np.unique(result.labels["t1"])) == {0, 1, 2}
+    assert all(row.event != DIVISION for row in result.records)
+
+
+def test_two_lesions_that_merge_keep_both_parents_on_the_new_number():
+    shape = (4, 4, 24)
+    organs = _liver(shape)
+    left = _box(shape, (0, 0, 2), (4, 4, 4))
+    right = _box(shape, (0, 0, 12), (4, 4, 4))
+    merged = _box(shape, (0, 0, 2), (4, 4, 14))
+    result = track([
+        _exam("t0", organs, left + right),
+        _exam("t1", organs, merged),
+    ], registrar=_Identity(), min_voxels=4)
+    assert set(np.unique(result.labels["t1"])) == {0, 3}
+    child = next(row for row in result.records if row.time_id == "t1" and row.status == FUSION)
+    assert child.status == FUSION
+    assert set(child.parent_ids) == {1, 2}
+    parents = [row for row in result.records if row.time_id == "t1" and row.status == FUSIONNEE]
+    assert {row.lesion_id for row in parents} == {1, 2}
+    assert all(row.child_ids == (3,) for row in parents)
+
+
+def test_parts_that_still_touch_by_a_corner_stay_one_component():
+    shape = (6, 6, 6)
+    organs = _liver(shape)
+    mask = np.zeros(shape, np.int32)
+    mask[1:3, 1:3, 1:3] = 1
+    mask[3:5, 3:5, 3:5] = 1
+    instances = extract_instances(mask, organs, (1.0, 1.0, 1.0), min_voxels=4)
+    assert set(np.unique(instances)) == {0, 1}
 
 
 def _ball(shape, center, radius):
