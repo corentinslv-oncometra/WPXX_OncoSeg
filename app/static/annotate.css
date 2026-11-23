@@ -47,7 +47,8 @@ body.longitudinal-mode .inspector>:not(#follow-inspector){display:none!important
 body.longitudinal-mode #follow-inspector{display:flex}
 #follow-inspector h2{margin:0;font-size:15px}
 .lesion-cards{display:flex;flex-direction:column;gap:10px}
-.lesion-card{border:1px solid #24343a;border-left-width:4px;border-radius:8px;padding:10px;background:#10181c;color:#d5e2e4}
+.lesion-card{border:1px solid #24343a;border-left-width:4px;border-radius:8px;padding:10px;background:#10181c;color:#d5e2e4;cursor:pointer}
+.lesion-card.is-selected{background:#17262c;box-shadow:inset 0 0 0 1px #7eb8c4}
 .lesion-card header{display:flex;align-items:center;gap:8px;font-size:14px}
 .lesion-number{display:inline-flex;align-items:center;gap:2px;font-weight:700}
 .lesion-number input{width:3.4em;margin:0;padding:1px 4px;border:1px solid #345058;border-radius:4px;background:#0c1418;color:#fff;font:inherit;font-variant-numeric:tabular-nums}
@@ -62,5 +63,6 @@ body.longitudinal-mode #follow-inspector{display:flex}
 #follow-chart{width:100%;height:150px;background:#10181c;border-radius:6px}
 .long-panel{display:flex;flex-direction:column;min-width:0;min-height:0;background:#050809;border-right:1px solid #1c2a30}
 .long-panel header{display:flex;justify-content:space-between;gap:8px;padding:8px 10px;color:#d5e2e4;font-size:12px}
-.long-panel canvas{flex:1;min-height:0;width:100%}
+.long-panel canvas{flex:1;min-height:0;width:100%;cursor:grab;touch-action:none}
+.long-panel canvas:active{cursor:grabbing}
 .long-panel input{margin:0 10px 10px}

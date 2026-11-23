@@ -3,7 +3,7 @@ import {PLANE_AXES, zoomTransform, wheelPixels, nextFocus, isTextEditing, UndoQu
 import {workflowState, STATUS_LABELS} from '/annotation-workflow.mjs?v=nodules-1';
 import {jobNoduleLabel, selectedNodule} from '/nodule-controls.mjs?v=nodules-1';
 import {DIAMETER_PRESETS, createEditSettings, normalizeDiameter, strokeSpec, sphereSectionRadius} from '/mask-editing.mjs?v=mask-tools-1';
-import {createLongitudinal} from '/assets/longitudinal.mjs?v=follow-13';
+import {createLongitudinal} from '/assets/longitudinal.mjs?v=follow-14';
 
 const $ = (id) => document.getElementById(id);
 const embedded = new URLSearchParams(location.search).get('embedded') === '1';

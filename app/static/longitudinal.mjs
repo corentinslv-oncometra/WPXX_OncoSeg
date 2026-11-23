@@ -1,3 +1,5 @@
+import {wheelPixels, zoomTransform} from '/viewer-controls.mjs?v=fullscreen-1';
+
 const COLORS = [[255, 99, 71], [255, 193, 7], [0, 188, 255], [186, 104, 200], [129, 199, 132], [255, 138, 101], [144, 202, 249], [244, 143, 177]];
 
 export function lesionColor(id) {
@@ -26,6 +28,7 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
   let dates = [];
   let rows = [];
   let registeredZ = null;
+  let selectedId = null;
   let drawing = false;
 
   function redraw() {
@@ -51,7 +54,7 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
     date.slice = slice;
     const {width: windowWidth, level} = windowing();
     const low = level - windowWidth / 2;
-    const key = [slice, low, windowWidth, date.volume, date.labels];
+    const key = [slice, low, windowWidth, date.volume, date.labels, selectedId];
     if (!date.rasterKey || key.some((value, index) => value !== date.rasterKey[index])) {
       date.bitmap.width = width;
       date.bitmap.height = height;
@@ -63,7 +66,7 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
         const index = base + y * width + sourceX;
         const gray = Math.max(0, Math.min(255, (date.volume[index] - low) * 255 / windowWidth));
         const label = date.labels ? date.labels[index] : 0;
-        const color = label ? lesionColor(label) : null;
+        const color = label && (!selectedId || label === selectedId) ? lesionColor(label) : null;
         const pixel = (y * width + x) * 4;
         if (color) {
           pixels.data[pixel] = gray * 0.45 + color[0] * 0.55;
@@ -77,17 +80,19 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
       date.bitmap.getContext('2d').putImageData(pixels, 0, 0);
       date.rasterKey = key;
     }
-    const scale = Math.max(0.01, Math.min((rect.width - 16) / (width * date.spacing_xyz[0]), (rect.height - 16) / (height * date.spacing_xyz[1])));
+    const fit = Math.max(0.01, Math.min((rect.width - 16) / (width * date.spacing_xyz[0]), (rect.height - 16) / (height * date.spacing_xyz[1])));
+    const scale = fit * date.zoom;
     const dw = width * date.spacing_xyz[0] * scale;
     const dh = height * date.spacing_xyz[1] * scale;
     ctx.imageSmoothingEnabled = true;
-    const left = (rect.width - dw) / 2;
-    const top = (rect.height - dh) / 2;
+    const left = (rect.width - dw) / 2 + date.pan[0];
+    const top = (rect.height - dh) / 2 + date.pan[1];
     ctx.drawImage(date.bitmap, left, top, dw, dh);
-    markVisibleLesions(ctx, date, left, top, scale);
+    markVisibleLesions(ctx, date, left, top, scale, selectedId);
     const badge = date.node.querySelector('.long-slice');
     const z = nativeZ(slice, date);
-    badge.textContent = `${slice + 1}/${depth} · ${z.toFixed(1)} mm`;
+    const magnification = Math.abs(date.zoom - 1) < 0.01 ? '' : ` · ${Math.round(date.zoom * 100)} %`;
+    badge.textContent = `${slice + 1}/${depth} · ${z.toFixed(1)} mm${magnification}`;
     date.slider.max = String(depth - 1);
     date.slider.value = String(slice);
   }
@@ -117,10 +122,34 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
   }
 
   function renderInspector() {
-    const cards = rows.map((row) => lesionCard(row, dates)).join('');
-    inspector.innerHTML = `<h2>Suivi longitudinal</h2><p class="fine-print">Toutes les lésions coupées par la vue sont affichées ensemble. Chaque barre fait défiler uniquement son examen. Le numéro d’une carte vaut pour toutes les dates.</p><div class="lesion-cards">${cards || '<p class="fine-print">Aucune lésion numérotée.</p>'}</div><canvas id="follow-chart" width="280" height="150" aria-label="Évolution des volumes"></canvas>`;
+    const cards = rows.map((row) => lesionCard(row, dates, selectedId)).join('');
+    inspector.innerHTML = `<h2>Suivi longitudinal</h2><p class="fine-print">Un clic sur une carte n’affiche que cette lésion. Un second clic les réaffiche toutes. Molette : coupe. Ctrl+molette : zoom. Glisser : déplacer. Double-clic : revenir au zoom d’origine.</p><div class="lesion-cards">${cards || '<p class="fine-print">Aucune lésion numérotée.</p>'}</div><canvas id="follow-chart" width="280" height="150" aria-label="Évolution des volumes"></canvas>`;
     drawChart();
     bindNumbers();
+    bindCards();
+  }
+
+  function bindCards() {
+    inspector.querySelectorAll('.lesion-card').forEach((card) => {
+      card.addEventListener('click', (event) => {
+        if (event.target.closest('input')) return;
+        selectLesion(Number(card.dataset.lesion));
+      });
+    });
+  }
+
+  function selectLesion(id) {
+    if (!Number.isInteger(id) || id < 1) return;
+    selectedId = selectedId === id ? null : id;
+    for (const date of dates) date.rasterKey = null;
+    renderInspector();
+    if (selectedId == null) {
+      redraw();
+      return;
+    }
+    const placed = dates.flatMap((date) => (date.lesions || []).filter((lesion) => lesion.lesion_id === selectedId && typeof lesion.registered_z_mm === 'number'));
+    if (placed.length) align(placed[0].registered_z_mm);
+    else redraw();
   }
 
   function bindNumbers() {
@@ -172,6 +201,8 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
       date.slice = slices.get(date.time_id) ?? date.slice;
     }));
     if (!active) return;
+    if (selectedId != null && !rows.some((row) => row.lesion_id === selectedId)) selectedId = null;
+    for (const date of dates) date.rasterKey = null;
     renderInspector();
     redraw();
   }
@@ -231,7 +262,8 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
     exit();
     active = true;
     rows = bundle.rows || [];
-    dates = (bundle.dates || []).map((date) => ({...date, volume: null, labels: null, slice: 0, bitmap: document.createElement('canvas'), rasterKey: null}));
+    selectedId = null;
+    dates = (bundle.dates || []).map((date) => ({...date, volume: null, labels: null, slice: 0, zoom: 1, pan: [0, 0], bitmap: document.createElement('canvas'), rasterKey: null}));
     view.replaceChildren();
     for (const date of dates) {
       const panel = document.createElement('article');
@@ -241,10 +273,7 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
       date.canvas = panel.querySelector('canvas');
       date.slider = panel.querySelector('input');
       date.slider.addEventListener('input', () => move(date, Number(date.slider.value)));
-      panel.addEventListener('wheel', (event) => {
-        event.preventDefault();
-        move(date, date.slice + (event.deltaY > 0 ? 1 : -1));
-      }, {passive: false});
+      bindViewport(date);
       view.append(panel);
     }
     onChange(true);
@@ -260,12 +289,57 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
     showEveryLesion();
   }
 
+  function bindViewport(date) {
+    const canvas = date.canvas;
+    canvas.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      const delta = wheelPixels(event, canvas.clientHeight);
+      if (event.ctrlKey || event.metaKey || event.shiftKey) {
+        const rect = canvas.getBoundingClientRect();
+        const anchor = [event.clientX - rect.left - rect.width / 2, event.clientY - rect.top - rect.height / 2];
+        const factor = Math.exp(-Math.max(-100, Math.min(100, delta)) * 0.01);
+        Object.assign(date, zoomTransform(date.zoom, date.pan, factor, anchor));
+        paint(date);
+        return;
+      }
+      if (!date.wheelTime || event.timeStamp - date.wheelTime > 160 || Math.sign(delta) !== Math.sign(date.wheelRemainder || 0)) date.wheelRemainder = 0;
+      date.wheelTime = event.timeStamp;
+      date.wheelRemainder = (date.wheelRemainder || 0) + delta;
+      const steps = Math.trunc(date.wheelRemainder / 24);
+      date.wheelRemainder -= steps * 24;
+      if (steps) move(date, date.slice + steps);
+    }, {passive: false});
+    canvas.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      const previous = date.lastClick;
+      date.lastClick = {time: event.timeStamp, x: event.clientX, y: event.clientY};
+      const repeat = event.detail >= 2 || (previous && event.timeStamp - previous.time < 400 && Math.hypot(event.clientX - previous.x, event.clientY - previous.y) < 6);
+      if (repeat) {
+        date.zoom = 1;
+        date.pan = [0, 0];
+        date.drag = null;
+        paint(date);
+        return;
+      }
+      canvas.setPointerCapture(event.pointerId);
+      date.drag = {x: event.clientX, y: event.clientY, pan: [...date.pan]};
+    });
+    canvas.addEventListener('pointermove', (event) => {
+      if (!date.drag) return;
+      date.pan = [date.drag.pan[0] + event.clientX - date.drag.x, date.drag.pan[1] + event.clientY - date.drag.y];
+      paint(date);
+    });
+    canvas.addEventListener('pointerup', () => { date.drag = null; });
+    canvas.addEventListener('pointercancel', () => { date.drag = null; });
+  }
+
   function exit() {
     if (!active && !dates.length) return;
     active = false;
     dates = [];
     rows = [];
     registeredZ = null;
+    selectedId = null;
     view.replaceChildren();
     inspector.innerHTML = '';
     onChange(false);
@@ -294,12 +368,12 @@ function busiestSlice(date) {
   return best;
 }
 
-function markVisibleLesions(ctx, date, left, top, scale) {
+function markVisibleLesions(ctx, date, left, top, scale, selectedId) {
   if (!date.labels) return;
   const [width, height] = date.size_xyz;
   const base = date.slice * height * width;
   const signX = date.direction[0] < 0 ? -1 : 1;
-  const parts = sliceParts(date.labels, base, width, height, signX);
+  const parts = sliceParts(date.labels, base, width, height, signX, selectedId);
   ctx.font = '700 12px sans-serif';
   ctx.textBaseline = 'bottom';
   for (const mark of parts.sort((left, right) => left.label - right.label || left.x - right.x)) {
@@ -319,7 +393,7 @@ function markVisibleLesions(ctx, date, left, top, scale) {
   }
 }
 
-function sliceParts(labels, base, width, height, signX) {
+function sliceParts(labels, base, width, height, signX, selectedId) {
   const seen = new Uint8Array(width * height);
   const parts = [];
   const stack = [];
@@ -328,7 +402,7 @@ function sliceParts(labels, base, width, height, signX) {
     const start = y * width + x;
     if (seen[start]) continue;
     const label = labels[source(x, y)];
-    if (!label) continue;
+    if (!label || (selectedId && label !== selectedId)) continue;
     seen[start] = 1;
     stack.push(x, y);
     let sumX = 0;
@@ -356,7 +430,7 @@ function sliceParts(labels, base, width, height, signX) {
   return parts;
 }
 
-function lesionCard(row, dates) {
+function lesionCard(row, dates, selectedId) {
   const color = lesionColor(row.lesion_id);
   const blocks = dates.map((date) => {
     const measure = row.measures?.[date.time_id];
@@ -368,7 +442,7 @@ function lesionCard(row, dates) {
     return `<section class="lesion-when"><h3>${title} · ${escapeText(measure.status || '—')}</h3><dl><dt>Volume</dt><dd>${formatVolume(measure.volume_cm3)} cm³</dd><dt>Grand axe</dt><dd>${formatMm(measure.long_axis_3d_mm)}</dd><dt>Axe axial</dt><dd>${formatMm(measure.long_axis_axial_mm)}</dd><dt>HU moyen</dt><dd>${formatHu(measure.hu_mean)}</dd></dl></section>`;
   }).join('');
   const link = lineage(row);
-  return `<article class="lesion-card" style="border-color:rgb(${color.join(',')})"><header><span class="long-swatch" style="background:rgb(${color.join(',')})"></span><label class="lesion-number">N<input type="number" min="1" max="65535" step="1" value="${row.lesion_id}" data-lesion="${row.lesion_id}" aria-label="Numéro de N${row.lesion_id} pour toutes les dates" title="Ce numéro vaut pour toutes les dates"></label>${link ? `<span>${link}</span>` : ''}<span class="delta">${formatDelta(row.delta_percent)}</span></header>${blocks}</article>`;
+  return `<article class="lesion-card${selectedId === row.lesion_id ? ' is-selected' : ''}" data-lesion="${row.lesion_id}" aria-pressed="${selectedId === row.lesion_id}" style="border-color:rgb(${color.join(',')})"><header><span class="long-swatch" style="background:rgb(${color.join(',')})"></span><label class="lesion-number">N<input type="number" min="1" max="65535" step="1" value="${row.lesion_id}" data-lesion="${row.lesion_id}" aria-label="Numéro de N${row.lesion_id} pour toutes les dates" title="Ce numéro vaut pour toutes les dates"></label>${link ? `<span>${link}</span>` : ''}<span class="delta">${formatDelta(row.delta_percent)}</span></header>${blocks}</article>`;
 }
 
 function lineage(row) {
