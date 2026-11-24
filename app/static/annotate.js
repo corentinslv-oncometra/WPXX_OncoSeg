@@ -637,23 +637,41 @@ function renderView(view) {
   const drawn = (view.organOutlines || []).filter((item) => item.points.length);
   if (drawn.length && state.organVisible) {
     const px = dw / width, py = dh / height;
-    const radius = Math.max(px, py) * (view.plane === "axial" ? 2.4 : 0.85);
+    const axial = view.plane === "axial";
+    const radius = axial ? Math.max(px, py) * 2.4 : Math.max(1.15, Math.min(px, py) * 0.95);
     ctx.save();
     ctx.globalAlpha = 1;
     ctx.fillStyle = ORGAN_BOX_GREEN;
+    ctx.strokeStyle = ORGAN_BOX_GREEN;
+    ctx.lineWidth = radius * 2;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
     ctx.font = "700 12px sans-serif";
     ctx.textAlign = "left";
     for (const item of drawn) {
-      ctx.beginPath();
+      const seen = new Set();
       let labelU = item.points[0], labelV = item.points[1];
       for (let i = 0; i < item.points.length; i += 2) {
         const u = item.points[i], v = item.points[i + 1];
-        const x = left + (u + .5) * px, y = top + (v + .5) * py;
-        ctx.moveTo(x + radius, y);
-        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        seen.add(`${u},${v}`);
         if (v < labelV) { labelU = u; labelV = v; }
       }
-      ctx.fill();
+      ctx.beginPath();
+      for (let i = 0; i < item.points.length; i += 2) {
+        const u = item.points[i], v = item.points[i + 1];
+        const x = left + (u + .5) * px, y = top + (v + .5) * py;
+        if (!axial) {
+          for (const [du, dv] of [[1, 0], [0, 1]]) {
+            if (!seen.has(`${u + du},${v + dv}`)) continue;
+            ctx.moveTo(x, y);
+            ctx.lineTo(left + (u + du + .5) * px, top + (v + dv + .5) * py);
+          }
+        }
+        ctx.moveTo(x + radius, y);
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+      }
+      if (axial) ctx.fill();
+      else { ctx.stroke(); ctx.fill(); }
       ctx.fillText(item.name, left + (labelU + .5) * px + radius + 4, top + (labelV + .5) * py);
     }
     ctx.restore();
