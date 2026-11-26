@@ -19,6 +19,7 @@ from app.services.storage import DATA_ROOT
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 _catalogs: dict[str, dict] = {}
+_scans: dict[str, dict] = {}
 
 
 def resolve_data_dir(relative: str) -> Path:
@@ -59,9 +60,13 @@ def scan_catalog(relative: str) -> dict:
     return catalog
 
 
-def _scan_catalog(root: Path, relative: str) -> dict:
+def _scan_catalog(root: Path, relative: str, on_patient=None) -> dict:
+    patient_dirs = sorted((path for path in root.iterdir() if path.is_dir()), key=lambda path: path.name)
+    total = len(patient_dirs)
+    if on_patient is not None:
+        on_patient(0, total)
     patients = []
-    for patient_dir in sorted((path for path in root.iterdir() if path.is_dir()), key=lambda path: path.name):
+    for index, patient_dir in enumerate(patient_dirs, start=1):
         timepoints = []
         for study_dir in sorted((path for path in patient_dir.iterdir() if path.is_dir()), key=lambda path: path.name):
             for series_dir in sorted((path for path in study_dir.iterdir() if path.is_dir()), key=lambda path: path.name):
@@ -78,8 +83,95 @@ def _scan_catalog(root: Path, relative: str) -> dict:
         if timepoints:
             timepoints.sort(key=lambda item: item["label"])
             patients.append({"id": patient_dir.name, "timepoints": timepoints})
+        if on_patient is not None:
+            on_patient(index, total)
     text = relative.strip().replace("\\", "/").lstrip("/")
     return {"path": text, "patients": patients}
+
+
+def _scan_view(key: str) -> dict:
+    with _lock:
+        current = dict(_scans.get(key) or {})
+    catalog = current.get("catalog")
+    total = int(current.get("total") or 0)
+    done = int(current.get("done") or 0)
+    percent = 100 if current.get("state") == "done" else (0 if total == 0 else min(99, round(100 * done / total)))
+    view = {
+        "state": current.get("state") or "idle",
+        "done": done,
+        "total": total,
+        "percent": percent,
+        "message": current.get("message") or "",
+    }
+    if catalog is not None:
+        view["catalog"] = catalog
+    if current.get("error"):
+        view["error"] = current["error"]
+    return view
+
+
+def start_catalog_scan(relative: str) -> dict:
+    """Read the dataset in the background so the page can show how far the listing has gone."""
+    root = resolve_data_dir(relative)
+    key = str(root)
+    with _lock:
+        if key in _catalogs:
+            catalog = _catalogs[key]
+            count = len(catalog["patients"])
+            _scans[key] = {
+                "state": "done", "done": count, "total": count, "message": _scan_message(count, count),
+                "catalog": catalog, "error": "",
+            }
+            return _scan_view(key)
+        current = _scans.get(key)
+        if current and current.get("state") == "running":
+            return _scan_view(key)
+        _scans[key] = {
+            "state": "running", "done": 0, "total": 0, "message": "Lecture du dossier…",
+            "catalog": None, "error": "",
+        }
+    threading.Thread(target=_scan_job, args=(root, relative, key), daemon=True).start()
+    return _scan_view(key)
+
+
+def catalog_scan_status(relative: str) -> dict:
+    root = resolve_data_dir(relative)
+    return _scan_view(str(root))
+
+
+def _scan_message(done: int, total: int) -> str:
+    if total <= 0:
+        return "Aucun patient dans ce dossier."
+    return f"{done} / {total} patients"
+
+
+def _scan_job(root: Path, relative: str, key: str) -> None:
+    def on_patient(done: int, total: int) -> None:
+        with _lock:
+            job = _scans.get(key)
+            if job is None or job.get("state") != "running":
+                return
+            job["done"] = done
+            job["total"] = total
+            job["message"] = "Lecture du dossier…" if total == 0 else _scan_message(done, total)
+
+    try:
+        catalog = _scan_catalog(root, relative, on_patient)
+        with _lock:
+            walked = int((_scans.get(key) or {}).get("total") or 0)
+            kept = len(catalog["patients"])
+            _catalogs[key] = catalog
+            _scans[key] = {
+                "state": "done", "done": walked, "total": walked,
+                "message": f"{kept} patients avec des images." if kept else "Aucun volume dans ce dossier.",
+                "catalog": catalog, "error": "",
+            }
+    except Exception as error:
+        with _lock:
+            _scans[key] = {
+                "state": "failed", "done": 0, "total": 0, "message": str(error) or "La lecture du dossier a échoué.",
+                "catalog": None, "error": str(error) or "La lecture du dossier a échoué.",
+            }
 
 
 def _locate(catalog: dict, patient_id: str, timepoint_id: str):

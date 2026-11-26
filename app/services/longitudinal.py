@@ -137,6 +137,7 @@ def longitudinal_bundle(case_id: str, user_id: str) -> dict:
         raise LongitudinalError("Le suivi enregistré n’a pas de position recalée.")
     timeline = {row["label"]: row for row in patient_timeline(case_id)}
     studies = _studies_for_user(user_id, [row["case_id"] for row in timeline.values()])
+    alignments = {str(item.get("time_id")): item for item in payload.get("alignments") or [] if item.get("time_id")}
     dates = []
     for time_id in times:
         row = timeline.get(time_id)
@@ -161,6 +162,7 @@ def longitudinal_bundle(case_id: str, user_id: str) -> dict:
             "study_id": study_id,
             "shift_mm": registered_shift(centers),
             "lesions": centers,
+            "alignment": alignments.get(time_id),
         })
     if not dates:
         raise LongitudinalError("Le suivi existe, mais aucun examen n’est ouvert pour l’afficher.")

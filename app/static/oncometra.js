@@ -206,14 +206,89 @@ function renderPatientPicker(){
   $('browse-time').onchange=()=>{browse.timepointId=$('browse-time').value;};
   $('browse-open').onclick=action(()=>openBrowsed());
 }
+function showImportProgress(title, status){
+  const panel=$('import-live');
+  if(panel){
+    panel.hidden=false;
+    $('import-progress-title').textContent=title;
+    paintImportProgress(status);
+    panel.scrollIntoView({block:'nearest'});
+    return;
+  }
+  if($('import-progress-title')) $('import-progress-title').textContent=title;
+  if($('import-dialog')&&!$('import-dialog').open) $('import-dialog').showModal();
+  paintImportProgress(status);
+}
+function paintImportProgress(status){
+  const detail=$('import-progress-detail');
+  if(!detail) return;
+  detail.textContent=status.message||status.detail||'';
+  const known=typeof status.percent==='number';
+  const percent=known?Math.max(0,Math.min(100,Math.round(status.percent))):0;
+  $('import-progress-percent').textContent=known?`${percent} %`:'En cours';
+  $('import-progress-bar').style.width=known?`${percent}%`:'40%';
+  const error=$('import-progress-error');
+  error.hidden=!status.error;
+  error.textContent=status.error||'';
+}
+function closeImportProgress(){
+  const panel=$('import-live');
+  if(panel) panel.hidden=true;
+  if($('import-dialog')?.open) $('import-dialog').close();
+}
+function wait(ms){return new Promise(resolve=>setTimeout(resolve, ms));}
+async function watchCatalogScan(projectId, path){
+  showImportProgress('Ajout du dataset', {message:'Lecture du dossier…', percent:0});
+  let status=await api(`/api/projects/${projectId}/local-catalog/scan`, {path});
+  paintImportProgress(status);
+  while(status.state==='running'){
+    await wait(700);
+    status=await api(`/api/projects/${projectId}/local-catalog/scan?path=${encodeURIComponent(path)}`);
+    paintImportProgress(status);
+  }
+  if(status.state!=='done'||!status.catalog){
+    const message=status.error||status.message||'La lecture du dossier a échoué.';
+    paintImportProgress({...status, error:message, state:'failed'});
+    throw new Error(message);
+  }
+  return status.catalog;
+}
+function uploadImport(data, onProgress){
+  return new Promise((resolve, reject)=>{
+    const xhr=new XMLHttpRequest();
+    xhr.open('POST', '/api/import');
+    xhr.withCredentials=true;
+    xhr.upload.onprogress=event=>{
+      if(!event.lengthComputable||!event.total) return;
+      const ratio=event.loaded/event.total;
+      onProgress({percent:Math.round(ratio*85), message:`Envoi des fichiers… ${Math.round(ratio*100)} %`});
+    };
+    xhr.upload.onload=()=>onProgress({percent:90, message:'Lecture des séries…'});
+    xhr.onload=()=>{
+      let result={};
+      try{result=JSON.parse(xhr.responseText||'{}');}catch{_}
+      if(xhr.status<200||xhr.status>=300){
+        reject(new Error(typeof result.detail==='string'?result.detail:'L’import a échoué.'));
+        return;
+      }
+      resolve(result);
+    };
+    xhr.onerror=()=>reject(new Error('L’envoi des fichiers a échoué.'));
+    xhr.send(data);
+  });
+}
 async function loadPatientPicker(form){
   if(!form.deidentified.checked) throw new Error('Confirmez que les images sont dé-identifiées.');
   const projectId=new FormData(form).get('project_id');
   const path=$('local-path').value.trim();
   if(!path) throw new Error('Indiquez un dossier dans data.');
   $('local-status').textContent='Lecture des patients…';
-  const catalog=await api(`/api/projects/${projectId}/local-catalog?path=${encodeURIComponent(path)}`);
-  if(!catalog.patients.length) throw new Error('Aucun volume dans ce dossier.');
+  const catalog=await watchCatalogScan(projectId, path);
+  if(!catalog.patients.length){
+    paintImportProgress({message:'Aucun volume dans ce dossier.', error:'Aucun volume dans ce dossier.'});
+    throw new Error('Aucun volume dans ce dossier.');
+  }
+  closeImportProgress();
   state.browse={projectId, path, catalog, patientId:catalog.patients[0].id, timepointId:catalog.patients[0].timepoints[0].id};
   renderPatientPicker();
 }
@@ -228,7 +303,16 @@ async function openBrowsed(target){
   const timepointId=target?.timepoint_id||$('browse-time')?.value||browse.timepointId;
   if($('browse-menu')) $('browse-menu').textContent='Ouverture…';
   if($('browse-open')){$('browse-open').disabled=true;$('browse-open').textContent='Ouverture…';}
-  const result=await api(`/api/projects/${browse.projectId}/local-catalog/open`,{path:browse.path,patient_id:patientId,timepoint_id:timepointId});
+  showImportProgress('Ouverture de l’examen', {message:'Lecture de la série et écriture du volume…'});
+  let result;
+  try{
+    result=await api(`/api/projects/${browse.projectId}/local-catalog/open`,{path:browse.path,patient_id:patientId,timepoint_id:timepointId});
+  }catch(error){
+    paintImportProgress({message:'L’examen n’a pas pu être ouvert.', error:error.message});
+    if($('browse-open')){$('browse-open').disabled=false;$('browse-open').textContent='Ouvrir cet examen';}
+    throw error;
+  }
+  closeImportProgress();
   state.browse={...browse, ...result, patientId:result.patient_id, timepointId:result.timepoint_id};
   if($('modal')?.open) $('modal').close();
   await refresh(false);
@@ -284,23 +368,63 @@ function importImages(cohortItem=null, projectId=''){
   const cohorts=cohortProjects();
   if(!cohorts.length) return toast('Ouvrez d’abord un dataset.', true);
   const selected=projectId||state.project||cohorts[0].id;
-  showModal('Importer des images',`<form id="import-form"><label class="form-label">Cohorte<select name="project_id">${projectOptions(false, selected)}</select></label><label class="form-label">Identifiant d’examen<input name="patient_id" maxlength="120" value="${escape(cohortItem?.patient_id||'')}" ${cohortItem?'readonly':''} placeholder="ex. COHORTE-012"></label>${cohortItem?`<input type="hidden" name="cohort_item_id" value="${cohortItem.id}">`:''}<div id="drop-zone" class="drop-zone">Déposez des fichiers DICOM, un dossier, une archive ZIP ou un volume NIfTI<label>Choisir des fichiers<input id="upload-files" type="file" multiple></label><label>Choisir un dossier<input id="upload-folder" type="file" multiple webkitdirectory></label><p id="file-count">Aucun fichier</p></div><p class="small-note">Le dépôt depuis le navigateur est limité à 256 Mo.</p><label class="form-label">Dossier déjà dans data<input id="local-path" value="TCIA_Data/hcc_tace_seg" spellcheck="false"></label><div id="local-status" class="small-note">Un seul patient et un seul temps sont ouverts. Le reste du dossier reste sur le disque.</div><label class="form-label"><span><input name="deidentified" type="checkbox" required> Ces images sont dé-identifiées et autorisées pour cette cohorte.</span></label><button type="submit" id="import-local" class="primary">Choisir un patient</button><button type="submit" id="upload-submit">Importer la sélection</button></form>`);
-  let files=[];function selectedFiles(list){files=[...list];$('file-count').textContent=`${files.length} fichier${files.length>1?'s':''}`;}
-  for(const id of ['upload-files','upload-folder'])$(id).onchange=event=>selectedFiles(event.target.files);
+  showModal('Importer des images',`<form id="import-form"><div id="import-live" hidden><h3 id="import-progress-title">Import</h3><p id="import-progress-detail"></p><p id="import-progress-percent" class="detection-percent">0 %</p><div class="detection-track" aria-hidden="true"><span id="import-progress-bar"></span></div><p id="import-progress-error" class="error" hidden></p></div><label class="form-label">Cohorte<select name="project_id">${projectOptions(false, selected)}</select></label><label class="form-label">Identifiant d’examen<input name="patient_id" maxlength="120" value="${escape(cohortItem?.patient_id||'')}" ${cohortItem?'readonly':''} placeholder="ex. COHORTE-012"></label>${cohortItem?`<input type="hidden" name="cohort_item_id" value="${cohortItem.id}">`:''}<div id="drop-zone" class="drop-zone">Déposez des fichiers DICOM, un dossier, une archive ZIP ou un volume NIfTI<label>Choisir des fichiers<input id="upload-files" type="file" multiple></label><label>Choisir un dossier<input id="upload-folder" type="file" multiple webkitdirectory></label><p id="file-count">Aucun fichier</p></div><p class="small-note">Le dépôt depuis le navigateur est limité à 256 Mo.</p><label class="form-label">Dossier déjà dans data<input id="local-path" value="TCIA_Data/hcc_tace_seg" spellcheck="false"></label><div id="local-status" class="small-note">Un seul patient et un seul temps sont ouverts. Le reste du dossier reste sur le disque.</div><label class="form-label"><span><input name="deidentified" type="checkbox" required> Ces images sont dé-identifiées et autorisées pour cette cohorte.</span></label><button type="submit" id="import-local" class="primary">Choisir un patient</button><button type="submit" id="upload-submit">Importer la sélection</button></form>`);
+  let files=[];
+  function selectedFiles(list){files=[...list];$('file-count').textContent=`${files.length} fichier${files.length>1?'s':''}`;}
+  $('upload-files').onchange=event=>selectedFiles(event.target.files);
+  $('upload-folder').onchange=event=>{
+    selectedFiles(event.target.files);
+    const count=files.length;
+    const tooBig=count>3000;
+    showImportProgress('Dossier sélectionné', {
+      percent:100,
+      message:`${count} fichiers retenus.`,
+      error:tooBig?'Ce dossier dépasse la limite du navigateur : 3 000 fichiers et 256 Mo. Placez-le dans data, indiquez ce chemin, puis cliquez sur Choisir un patient.':'',
+    });
+  };
   const zone=$('drop-zone');zone.ondragover=event=>event.preventDefault();zone.ondrop=action(async event=>{event.preventDefault();const {collectDirectoryEntries}=await import('/import-files.mjs');const entries=[...event.dataTransfer.items].map(item=>item.webkitGetAsEntry?.()).filter(Boolean);if(entries.length){const result=await collectDirectoryEntries(entries);selectedFiles(result.map(item=>item.file));}else selectedFiles(event.dataTransfer.files);});
   $('import-form').onsubmit=action(async event=>{
     event.preventDefault();
     const submitter=event.submitter;
     if(submitter&&submitter.id==='upload-submit'){
-      if(!files.length) throw new Error('Sélectionnez des images, ou choisissez un patient.');
-      const bytes=files.reduce((total,file)=>total+file.size,0);
-      if(files.length>3000||bytes>256*1024*1024) throw new Error('Cette sélection est trop grande. Choisissez un patient et un temps.');
+      showImportProgress('Import de la sélection', {message:'Préparation de l’envoi…', percent:0});
+      await wait(30);
+      if(!files.length){
+        paintImportProgress({message:'Aucun fichier sélectionné.', error:'Sélectionnez des images, ou choisissez un patient.'});
+        throw new Error('Sélectionnez des images, ou choisissez un patient.');
+      }
+      if(files.length>3000){
+        paintImportProgress({percent:100, message:`${files.length} fichiers retenus.`, error:'Cette sélection est trop grande pour le navigateur. Placez le dossier dans data, indiquez ce chemin, puis cliquez sur Choisir un patient.'});
+        throw new Error('Cette sélection est trop grande. Choisissez un patient et un temps.');
+      }
+      let bytes=0;
+      for(let index=0;index<files.length;index++){
+        bytes+=files[index].size;
+        if(index%2000===0){
+          paintImportProgress({percent:Math.round(index/files.length*10), message:`Vérification des fichiers… ${index} / ${files.length}`});
+          await wait(0);
+        }
+      }
+      if(bytes>256*1024*1024){
+        paintImportProgress({percent:100, message:`${files.length} fichiers retenus.`, error:'Cette sélection dépasse 256 Mo. Placez le dossier dans data, indiquez ce chemin, puis cliquez sur Choisir un patient.'});
+        throw new Error('Cette sélection est trop grande. Choisissez un patient et un temps.');
+      }
       const data=new FormData(event.target);
       if(!String(data.get('patient_id')||'').trim()) throw new Error('Indiquez un identifiant d’examen.');
       for(const file of files) data.append('files',file,file.webkitRelativePath||file.name);
       $('upload-submit').disabled=true;$('upload-submit').textContent='Import…';
-      try{await api('/api/import',data);$('modal').close();await refresh();toast('Images importées.');}
-      finally{if($('upload-submit')){$('upload-submit').disabled=false;$('upload-submit').textContent='Importer la sélection';}}
+      showImportProgress('Import de la sélection', {message:'Envoi des fichiers…', percent:0});
+      try{
+        await uploadImport(data, paintImportProgress);
+        paintImportProgress({message:'Import terminé.', percent:100});
+        closeImportProgress();
+        $('modal').close();
+        await refresh();
+        toast('Images importées.');
+      }catch(error){
+        paintImportProgress({message:'L’import s’est arrêté.', error:error.message});
+        throw error;
+      }finally{if($('upload-submit')){$('upload-submit').disabled=false;$('upload-submit').textContent='Importer la sélection';}}
       return;
     }
     await loadPatientPicker(event.target);
@@ -376,6 +500,7 @@ let followStored=false;
 let detectionClock=null;
 let detectionTick=0;
 let detectionDismissed=false;
+let detectionStatus=null;
 function formatDuration(seconds){
   const total=Math.max(0,Math.floor(seconds));
   const hours=Math.floor(total/3600);
@@ -451,11 +576,14 @@ function workBusy(){
 }
 function syncWorkButtons(){
   const busy=workBusy();
-  for(const button of detectionButtons()) button.disabled=busy;
+  for(const button of detectionButtons()) button.disabled=button.id==='assignment-detect'?trackingRunning:busy;
   const track=$('assignment-track');
   if(track) track.disabled=detectionRunning;
+  const detect=$('assignment-detect');
+  if(detect&&detectionRunning) detect.title='Afficher la détection en cours';
 }
 function showDetection(status){
+  detectionStatus=status;
   detectionRunning=status.state==='running';
   if(detectionRunning) setDetectMenu(false);
   for(const button of detectionButtons()){
@@ -500,6 +628,10 @@ function startDetection(device){
   });
 }
 $('assignment-detect').onclick=()=>{
+  if(detectionRunning){
+    openDetection(detectionStatus||{state:'running', detail:'Détection en cours…'});
+    return;
+  }
   if($('assignment-detect').disabled) return;
   setDetectMenu($('detect-panel').hidden);
 };
@@ -650,6 +782,7 @@ function startTracking(){
     }
   });
 }
+$('import-progress-close').onclick=closeImportProgress;
 $('detection-close').onclick=closeDetection;
 $('tracking-close').onclick=hideTracking;
 $('assignment-track').onclick=startTracking();

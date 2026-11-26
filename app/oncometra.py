@@ -711,6 +711,30 @@ def local_import_status(project_id: str, user=Depends(current_user)):
     return import_status(project_id)
 
 
+class LocalCatalogScan(BaseModel):
+    path: str = Field(min_length=1, max_length=300)
+
+
+@app.post("/api/projects/{project_id}/local-catalog/scan", status_code=202)
+def begin_local_catalog_scan(project_id: str, req: LocalCatalogScan, user=Depends(current_user)):
+    from app.services.local_dicom_import import start_catalog_scan
+    require_project(user, project_id)
+    try:
+        return start_catalog_scan(req.path)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.get("/api/projects/{project_id}/local-catalog/scan")
+def local_catalog_scan(project_id: str, path: str = "", user=Depends(current_user)):
+    from app.services.local_dicom_import import catalog_scan_status
+    require_project(user, project_id)
+    try:
+        return catalog_scan_status(path)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
 @app.get("/api/projects/{project_id}/local-catalog")
 def local_catalog(project_id: str, path: str = "", user=Depends(current_user)):
     from app.services.local_dicom_import import scan_catalog

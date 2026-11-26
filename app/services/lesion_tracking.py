@@ -1,9 +1,9 @@
 """Track lesions across time using the segmented organs as a stable coordinate system.
 
 Each exam keeps its own lesion mask. Every component is numbered, whichever organ
-it sits in. Later exams are warped onto the baseline organs, not onto the
-lesions. Official ids are reused when a follow-up lesion overlaps that history
-or sits near its centroid.
+it sits in. A follow-up is warped onto the previous exam's organs, then compared
+with that exam's lesions. Official ids are reused when the lesion overlaps the
+previous mask or sits near its centroid.
 """
 
 from __future__ import annotations
@@ -11,21 +11,23 @@ from __future__ import annotations
 import json
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 import SimpleITK as sitk
-from scipy.ndimage import label
+from scipy.ndimage import binary_erosion, label
 from scipy.optimize import linear_sum_assignment
+from scipy.spatial import cKDTree
 
 from app.services.exam_autoseg import mask_matches_image
 
 logger = logging.getLogger(__name__)
 
-# TotalSegmentator task "total": liver is label 5.
+# TotalSegmentator task "total": liver is label 5, the five lung lobes are 10 to 14.
 TOTAL_LIVER_LABEL = 5
+LUNG_LABELS = (10, 11, 12, 13, 14)
 MIN_VOXELS = 4
 DILATION_MM = 3.0
 SIGMA_MM = 15.0
@@ -73,7 +75,7 @@ class Exam:
 
 @dataclass(frozen=True)
 class LesionView:
-    """One lesion on the baseline grid, plus the baseline shape when it differs from the latest one."""
+    """One lesion on the exam it is being compared with."""
 
     lesion_id: int
     mask: np.ndarray
@@ -119,17 +121,38 @@ class LesionRecord:
 
 
 @dataclass(frozen=True)
+class OrganAgreement:
+    """Overlap of one organ after this exam was warped onto the previous one."""
+
+    time_id: str
+    fixed_time_id: str
+    organ: str
+    dice: float | None
+    hd95_mm: float | None
+
+    def as_dict(self) -> dict:
+        return {
+            "time_id": self.time_id,
+            "fixed_time_id": self.fixed_time_id,
+            "organ": self.organ,
+            "dice": None if self.dice is None else round(float(self.dice), 2),
+            "hd95_mm": None if self.hd95_mm is None else round(float(self.hd95_mm), 1),
+        }
+
+
+@dataclass(frozen=True)
 class TrackingResult:
     baseline: str
     backend: str
     labels: dict[str, np.ndarray]
     records: list[LesionRecord]
+    alignments: list[OrganAgreement]
     settings: dict
 
 
 class AnatomyRegistrar(Protocol):
     def warp_labels(self, fixed: Exam, moving: Exam, labels: np.ndarray) -> np.ndarray:
-        """Resample moving instance labels onto the baseline grid with nearest neighbour."""
+        """Resample moving instance labels onto the fixed exam with nearest neighbour."""
 
 
 @dataclass
@@ -139,6 +162,7 @@ class _Tracked:
     latest_mask: np.ndarray
     baseline_axis_mm: float
     closed: bool = False
+    mask_time_id: str = ""
 
 
 def extract_instances(
@@ -204,15 +228,18 @@ def track(
     sigma_mm: float = SIGMA_MM,
     max_distance_mm: float = MAX_DISTANCE_MM,
     min_dice: float = MIN_DICE,
+    organ: str = "",
     report=None,
 ) -> TrackingResult:
-    """Number lesions on the first exam, then carry those ids forward in baseline space."""
+    """Number lesions on the first exam, then match each later exam to the one before it."""
     if not exams:
         raise LesionTrackingError("Aucun examen à suivre.")
     if len({exam.time_id for exam in exams}) != len(exams):
         raise LesionTrackingError("Deux examens portent le même identifiant de temps.")
     if registrar is None:
         registrar = make_registrar(backend, liver_labels)
+    if hasattr(registrar, "organ"):
+        registrar.organ = organ
     baseline = exams[0]
     count = len(exams)
 
@@ -229,14 +256,20 @@ def track(
     official, catalog = _open_catalog(local, baseline)
     labels = {baseline.time_id: official}
     records = [_record(item.lesion_id, baseline, official, NOUVELLE) for item in catalog]
+    alignments: list[OrganAgreement] = []
+    previous = baseline
+    frame_shift = 0.0
     for index, exam in enumerate(exams[1:], start=1):
-        tell(index, f"Recalage de l’anatomie du {exam.time_id} sur {baseline.time_id}…")
+        tell(index, f"Recalage de l’anatomie du {exam.time_id} sur {previous.time_id}…")
         _validate(exam)
-        labels[exam.time_id], born = _carry(
-            exam, baseline, catalog, registrar, liver_labels, min_voxels, dilation_mm,
-            sigma_mm, max_distance_mm, min_dice,
+        labels[exam.time_id], born, frame_shift, agreement = _carry(
+            exam, previous, catalog, registrar, liver_labels, min_voxels, dilation_mm,
+            sigma_mm, max_distance_mm, min_dice, frame_shift, organ,
         )
         records.extend(born)
+        if agreement is not None:
+            alignments.append(agreement)
+        previous = exam
     if report is not None:
         report(92, "Écriture du suivi…")
     return TrackingResult(
@@ -244,6 +277,7 @@ def track(
         backend=_backend_name(registrar),
         labels=labels,
         records=records,
+        alignments=alignments,
         settings={
             "sigma_mm": sigma_mm,
             "max_distance_mm": max_distance_mm,
@@ -305,6 +339,7 @@ def write_result(result: TrackingResult, exams: list[Exam], folder: Path) -> Non
         "backend": result.backend,
         **result.settings,
         "lesions": [record.as_dict() for record in result.records],
+        "alignments": [item.as_dict() for item in result.alignments],
     }
     (folder / "tracking.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -318,28 +353,34 @@ def make_registrar(backend: str, liver_labels: tuple[int, ...] = (TOTAL_LIVER_LA
 
 
 class SimpleItkAnatomyRegistrar:
-    """Affine alignment of every segmented organ, then a demons step inside that anatomy."""
+    """Affine alignment of every segmented organ, then a demons step inside that anatomy.
+
+    The affine starts at the center of the cancer organ when both exams contain it.
+    A missing organ keeps the center of the whole volume.
+    """
 
     def __init__(self, *, liver_labels: tuple[int, ...] = (TOTAL_LIVER_LABEL,), affine_iterations: int = 80, demons_iterations: int = 25):
         self.liver_labels = liver_labels
         self.affine_iterations = affine_iterations
         self.demons_iterations = demons_iterations
+        self.organ = ""
 
     def warp_labels(self, fixed: Exam, moving: Exam, labels: np.ndarray) -> np.ndarray:
         fixed_anatomy = _anatomy_image(fixed, self.liver_labels)
         moving_anatomy = _anatomy_image(moving, self.liver_labels)
-        initial = sitk.CenteredTransformInitializer(
-            fixed_anatomy, moving_anatomy, sitk.AffineTransform(3), sitk.CenteredTransformInitializerFilter.GEOMETRY,
-        )
+        initial = _initial_affine(fixed_anatomy, moving_anatomy, fixed, moving, self.organ, self.liver_labels)
         affine = _optimize_affine(fixed_anatomy, moving_anatomy, initial, self.affine_iterations)
         anatomy = _sitk_image(_organ_mask(fixed.organs).astype(np.uint8), fixed)
         transform = _add_demons(fixed_anatomy, moving_anatomy, affine, self.demons_iterations, anatomy)
-        moving_labels = _sitk_image(np.asarray(labels, dtype=np.uint16), moving)
-        warped = sitk.Resample(moving_labels, fixed_anatomy, transform, sitk.sitkNearestNeighbor, 0, sitk.sitkUInt16)
-        array = np.rint(sitk.GetArrayFromImage(warped)).astype(np.uint16)
-        if array.shape != fixed.ct.shape:
-            raise LesionTrackingError("Le masque recalé n’est pas sur la grille de référence.")
-        return array
+        self._last = (fixed, moving, fixed_anatomy, transform)
+        return _resample_nearest(fixed, moving, labels, fixed_anatomy, transform)
+
+    def resample_with_last(self, fixed: Exam, moving: Exam, labels: np.ndarray) -> np.ndarray:
+        """Resample another mask with the transform just computed for this pair."""
+        saved = getattr(self, "_last", None)
+        if saved is None or saved[0] is not fixed or saved[1] is not moving:
+            raise LesionTrackingError("Aucun recalage récent pour ces deux examens.")
+        return _resample_nearest(fixed, moving, labels, saved[2], saved[3])
 
 
 class AntsAnatomyRegistrar:
@@ -347,6 +388,7 @@ class AntsAnatomyRegistrar:
 
     def __init__(self, *, liver_labels: tuple[int, ...] = (TOTAL_LIVER_LABEL,)):
         self.liver_labels = liver_labels
+        self.organ = ""
 
     def warp_labels(self, fixed: Exam, moving: Exam, labels: np.ndarray) -> np.ndarray:
         try:
@@ -355,16 +397,23 @@ class AntsAnatomyRegistrar:
             raise LesionTrackingError(
                 "antspyx n’est pas installé. Installe-le avec pip install antspyx, ou laisse le recalage SimpleITK."
             ) from error
+        placed = _place_on_organ(moving, fixed, self.organ, self.liver_labels)
         fixed_anatomy = _ants_image(ants, _anatomy_array(fixed, self.liver_labels), fixed)
-        moving_anatomy = _ants_image(ants, _anatomy_array(moving, self.liver_labels), moving)
+        moving_anatomy = _ants_image(ants, _anatomy_array(moving, self.liver_labels), placed)
         anatomy = _ants_image(ants, _organ_mask(fixed.organs).astype(np.uint8), fixed)
         registration = ants.registration(fixed_anatomy, moving_anatomy, type_of_transform="SyNRA", mask=anatomy, verbose=False)
-        moving_labels = _ants_image(ants, np.transpose(np.asarray(labels), (2, 1, 0)).astype(np.float32), moving)
-        warped = ants.apply_transforms(fixed_anatomy, moving_labels, registration["fwdtransforms"], interpolator="nearestNeighbor")
-        return np.rint(np.transpose(warped.numpy(), (2, 1, 0))).astype(np.uint16)
+        self._last = (fixed, moving, ants, fixed_anatomy, registration["fwdtransforms"], placed.origin_mm)
+        return _resample_ants(saved=self._last, labels=labels)
+
+    def resample_with_last(self, fixed: Exam, moving: Exam, labels: np.ndarray) -> np.ndarray:
+        """Resample another mask with the transform just computed for this pair."""
+        saved = getattr(self, "_last", None)
+        if saved is None or saved[0] is not fixed or saved[1] is not moving:
+            raise LesionTrackingError("Aucun recalage récent pour ces deux examens.")
+        return _resample_ants(saved=saved, labels=labels)
 
 
-def _apply_lineage(exam, baseline, catalog, local, warped, official, references, candidates):
+def _apply_lineage(exam, fixed, catalog, local, warped, official, references, candidates, frame_shift):
     """A split keeps the parent's number on every part. A fusion still receives a new number."""
     next_id = 1 + max((item.lesion_id for item in catalog), default=0)
     records = []
@@ -372,23 +421,23 @@ def _apply_lineage(exam, baseline, catalog, local, warped, official, references,
     claimed_candidates: set[int] = set()
     for parent_id, daughter_ids in _splits(references, candidates):
         parent = _find(catalog, parent_id)
-        union = np.zeros(parent.latest_mask.shape, dtype=bool)
+        union = np.zeros(warped.shape, dtype=bool)
         for local_id in daughter_ids:
             official[local == local_id] = parent_id
             union |= warped == local_id
-        parent.latest_mask = union
+        _remember(parent, exam, official == parent_id)
         records.append(_record(
             parent_id, exam, official, DIVISION,
-            registered_z_mm=_registered_z(union, baseline), event=DIVISION,
+            registered_z_mm=_registered_z(union, fixed, frame_shift), event=DIVISION,
         ))
         claimed_references.add(parent_id)
         claimed_candidates.update(daughter_ids)
     for child_local, parent_ids in _fusions(references, candidates, claimed_references, claimed_candidates):
         child_ids = (next_id,)
         official[local == child_local] = next_id
-        _birth(catalog, exam, baseline, local, warped, child_local, next_id)
+        _birth(catalog, exam, local, child_local, next_id)
         records.append(_record(
-            next_id, exam, local, FUSION, registered_z_mm=_registered_z(warped == child_local, baseline),
+            next_id, exam, local, FUSION, registered_z_mm=_registered_z(warped == child_local, fixed, frame_shift),
             parent_ids=tuple(parent_ids), event=FUSION, measured_id=child_local,
         ))
         for parent_id in parent_ids:
@@ -405,11 +454,17 @@ def _apply_lineage(exam, baseline, catalog, local, warped, official, references,
     return records, claimed_references, claimed_candidates, next_id
 
 
-def _birth(catalog, exam, baseline, local, warped, local_id, official_id):
-    mask = warped == local_id
-    if not mask.any():
-        mask = np.zeros(baseline.ct.shape, dtype=bool)
-    catalog.append(_Tracked(official_id, mask, mask, _axis(local, local_id, exam)))
+def _birth(catalog, exam, local, local_id, official_id):
+    native = local == local_id
+    catalog.append(_Tracked(
+        official_id, native, native, _axis(local, local_id, exam), mask_time_id=exam.time_id,
+    ))
+
+
+def _remember(item: _Tracked, exam: Exam, native: np.ndarray) -> None:
+    """Keep the lesion as it is on this exam, so the next date can be compared with it."""
+    item.latest_mask = native
+    item.mask_time_id = exam.time_id
 
 
 def _splits(references, candidates) -> list[tuple[int, list[int]]]:
@@ -491,7 +546,25 @@ def _best_owner(candidate, references) -> tuple[int | None, int]:
     return owner, best_intersection
 
 
-def _carry(exam, baseline, catalog, registrar, liver_labels, min_voxels, dilation_mm, sigma_mm, max_distance_mm, min_dice):
+def _resample_nearest(fixed: Exam, moving: Exam, labels: np.ndarray, reference, transform) -> np.ndarray:
+    moving_labels = _sitk_image(np.asarray(labels, dtype=np.uint16), moving)
+    warped = sitk.Resample(moving_labels, reference, transform, sitk.sitkNearestNeighbor, 0, sitk.sitkUInt16)
+    array = np.rint(sitk.GetArrayFromImage(warped)).astype(np.uint16)
+    if array.shape != fixed.ct.shape:
+        raise LesionTrackingError("Le masque recalé n’est pas sur la grille de référence.")
+    return array
+
+
+def _resample_ants(saved, labels: np.ndarray) -> np.ndarray:
+    _fixed, _moving, ants, reference, transforms, origin = saved
+    moving_labels = _ants_image(
+        ants, np.transpose(np.asarray(labels), (2, 1, 0)).astype(np.float32), _moving, origin=origin,
+    )
+    warped = ants.apply_transforms(reference, moving_labels, transforms, interpolator="nearestNeighbor")
+    return np.rint(np.transpose(warped.numpy(), (2, 1, 0))).astype(np.uint16)
+
+
+def _carry(exam, fixed, catalog, registrar, liver_labels, min_voxels, dilation_mm, sigma_mm, max_distance_mm, min_dice, frame_shift, organ):
     local = extract_instances(
         exam.lesions, exam.organs, exam.spacing_mm,
         liver_labels=liver_labels, min_voxels=min_voxels, dilation_mm=dilation_mm,
@@ -499,17 +572,22 @@ def _carry(exam, baseline, catalog, registrar, liver_labels, min_voxels, dilatio
     official = np.zeros(local.shape, dtype=np.uint16)
     local_ids = _positive_ids(local)
     if not local_ids:
-        return official, _missing_records(exam.time_id, catalog, set())
+        born = _missing_records(exam.time_id, catalog, set())
+        return official, born, _frame_shift(born, frame_shift), None
     try:
-        warped = registrar.warp_labels(baseline, exam, local)
+        warped = registrar.warp_labels(fixed, exam, local)
     except LesionTrackingError:
         raise
     except Exception as error:
         raise LesionTrackingError(f"{exam.time_id} : le recalage a échoué ({error}).") from error
-    candidates = _views(warped, _positive_ids(warped), baseline)
-    references = [_catalog_view(item, baseline) for item in catalog if not item.closed]
+    candidates = _views(warped, _positive_ids(warped), fixed)
+    references = [
+        _catalog_view(item, fixed)
+        for item in catalog
+        if not item.closed and item.mask_time_id == fixed.time_id and np.any(item.latest_mask)
+    ]
     records, claimed_references, claimed_candidates, next_id = _apply_lineage(
-        exam, baseline, catalog, local, warped, official, references, candidates,
+        exam, fixed, catalog, local, warped, official, references, candidates, frame_shift,
     )
     references = [item for item in references if item.lesion_id not in claimed_references]
     candidates = [item for item in candidates if item.lesion_id not in claimed_candidates]
@@ -523,28 +601,29 @@ def _carry(exam, baseline, catalog, registrar, liver_labels, min_voxels, dilatio
     for local_id, official_id in local_to_official.items():
         official[local == local_id] = official_id
         item = _find(catalog, official_id)
-        item.latest_mask = warped == local_id
+        _remember(item, exam, local == local_id)
         records.append(_record(
             official_id, exam, official,
             _lesion_status(_axis(official, official_id, exam), item.baseline_axis_mm),
-            registered_z_mm=_registered_z(warped == local_id, baseline),
+            registered_z_mm=_registered_z(warped == local_id, fixed, frame_shift),
         ))
         used.add(official_id)
     fresh = [local_id for local_id in local_ids if local_id not in local_to_official and local_id not in claimed_candidates]
     fresh.sort(key=lambda local_id: _rank_key(local, local_id, exam))
     for local_id in fresh:
         official[local == local_id] = next_id
-        mask = warped == local_id
-        if not mask.any():
-            mask = np.zeros(baseline.ct.shape, dtype=bool)
+        native = local == local_id
         axis = _axis(official, next_id, exam)
-        catalog.append(_Tracked(next_id, mask, mask, axis))
-        records.append(_record(next_id, exam, official, NOUVELLE, registered_z_mm=_registered_z(mask, baseline)))
+        catalog.append(_Tracked(next_id, native, native, axis, mask_time_id=exam.time_id))
+        records.append(_record(
+            next_id, exam, official, NOUVELLE,
+            registered_z_mm=_registered_z(warped == local_id, fixed, frame_shift),
+        ))
         used.add(next_id)
         next_id += 1
     records.extend(_missing_records(exam.time_id, catalog, used))
     records.sort(key=lambda record: record.lesion_id)
-    return official, records
+    return official, records, _frame_shift(records, frame_shift), _agreement_after_warp(exam, fixed, registrar, organ)
 
 
 def _open_catalog(local: np.ndarray, exam: Exam) -> tuple[np.ndarray, list[_Tracked]]:
@@ -554,19 +633,16 @@ def _open_catalog(local: np.ndarray, exam: Exam) -> tuple[np.ndarray, list[_Trac
     for official_id, local_id in enumerate(ranked, start=1):
         official[local == local_id] = official_id
         mask = official == official_id
-        catalog.append(_Tracked(official_id, mask, mask, _axis(official, official_id, exam)))
+        catalog.append(_Tracked(
+            official_id, mask, mask, _axis(official, official_id, exam), mask_time_id=exam.time_id,
+        ))
     return official, catalog
 
 
 def _catalog_view(item: _Tracked, exam: Exam) -> LesionView:
     latest = item.latest_mask.astype(bool, copy=False)
-    alternate = None
-    alternate_centroid = None
-    if item.baseline_mask is not item.latest_mask and item.baseline_mask.any():
-        alternate = item.baseline_mask.astype(bool, copy=False)
-        alternate_centroid = _centroid_mm(alternate, exam)
-    centroid = _centroid_mm(latest, exam) if latest.any() else (alternate_centroid or (0.0, 0.0, 0.0))
-    return LesionView(item.lesion_id, latest, centroid, alternate, alternate_centroid)
+    centroid = _centroid_mm(latest, exam) if latest.any() else (0.0, 0.0, 0.0)
+    return LesionView(item.lesion_id, latest, centroid)
 
 
 def _views(labels: np.ndarray, ids: list[int], exam: Exam) -> list[LesionView]:
@@ -604,10 +680,22 @@ def _record(
     )
 
 
-def _registered_z(mask: np.ndarray, exam: Exam) -> float | None:
+def _registered_z(mask: np.ndarray, exam: Exam, frame_shift: float) -> float | None:
     if not np.any(mask):
         return None
-    return _centroid_mm(mask, exam)[2]
+    return _centroid_mm(mask, exam)[2] + frame_shift
+
+
+def _frame_shift(records: list[LesionRecord], previous: float) -> float:
+    """Shift that puts this exam's native Z into the first exam's frame, for the viewer."""
+    deltas = [
+        float(record.registered_z_mm) - float(record.z_mm)
+        for record in records
+        if record.registered_z_mm is not None and record.z_mm is not None
+    ]
+    if not deltas:
+        return previous
+    return float(np.median(deltas))
 
 
 def _missing_records(time_id: str, catalog: list[_Tracked], used: set[int]) -> list[LesionRecord]:
@@ -631,6 +719,69 @@ def _best_score(reference: LesionView, candidate: LesionView, sigma_mm: float) -
         if score > best[0]:
             best = (score, overlap, distance)
     return best
+
+
+def organ_agreement(
+    time_id: str,
+    fixed_time_id: str,
+    fixed_organs: np.ndarray,
+    warped_organs: np.ndarray,
+    spacing_mm: tuple[float, float, float],
+    organ: str,
+) -> OrganAgreement | None:
+    """Dice and Hausdorff 95 of the cancer's organ after the warp. None when both masks are empty."""
+    kind = organ or "organs"
+    fixed_mask = _target_mask(fixed_organs, kind)
+    moving_mask = _target_mask(warped_organs, kind)
+    if not fixed_mask.any() and not moving_mask.any():
+        return None
+    distance = hausdorff95_mm(fixed_mask, moving_mask, spacing_mm) if fixed_mask.any() and moving_mask.any() else None
+    return OrganAgreement(time_id, fixed_time_id, kind, dice(fixed_mask, moving_mask), distance)
+
+
+def _agreement_after_warp(exam: Exam, fixed: Exam, registrar, organ: str) -> OrganAgreement | None:
+    resampler = getattr(registrar, "resample_with_last", None)
+    if resampler is None:
+        return None
+    try:
+        warped = resampler(fixed, exam, np.asarray(exam.organs))
+    except Exception:
+        logger.exception("Organ overlap was not measured for %s", exam.time_id)
+        return None
+    return organ_agreement(exam.time_id, fixed.time_id, fixed.organs, warped, fixed.spacing_mm, organ)
+
+
+def _target_mask(organs: np.ndarray, kind: str) -> np.ndarray:
+    labels = np.asarray(organs)
+    if kind == "liver":
+        return labels == TOTAL_LIVER_LABEL
+    if kind == "lung":
+        return np.isin(labels, LUNG_LABELS)
+    return labels > 0
+
+
+def hausdorff95_mm(left: np.ndarray, right: np.ndarray, spacing_mm: tuple[float, float, float]) -> float:
+    """Largest of the two 95th-percentile surface distances, in millimetres."""
+    first = _surface_mm(left, spacing_mm)
+    second = _surface_mm(right, spacing_mm)
+    if len(first) == 0 or len(second) == 0:
+        raise LesionTrackingError("Le Hausdorff 95 demande deux surfaces.")
+    forward = cKDTree(second).query(first, k=1)[0]
+    backward = cKDTree(first).query(second, k=1)[0]
+    return float(max(np.percentile(forward, 95), np.percentile(backward, 95)))
+
+
+def _surface_mm(mask: np.ndarray, spacing_mm: tuple[float, float, float]) -> np.ndarray:
+    binary = np.asarray(mask, dtype=bool)
+    if not binary.any():
+        return np.zeros((0, 3), np.float64)
+    eroded = binary_erosion(binary, structure=np.ones((3, 3, 3), dtype=bool), border_value=0)
+    surface = binary & ~eroded
+    if not surface.any():
+        surface = binary
+    zyx = np.argwhere(surface)
+    sx, sy, sz = (float(value) for value in spacing_mm)
+    return np.column_stack((zyx[:, 2] * sx, zyx[:, 1] * sy, zyx[:, 0] * sz))
 
 
 def dice(left: np.ndarray, right: np.ndarray) -> float:
@@ -671,6 +822,47 @@ def _anatomy_image(exam: Exam, liver_labels: tuple[int, ...]):
     return _sitk_image(_anatomy_array(exam, liver_labels), exam)
 
 
+def _cancer_organ_mask(exam: Exam, organ: str, liver_labels: tuple[int, ...]) -> np.ndarray | None:
+    """The cancer organ, or nothing when this exam does not show it."""
+    labels = np.asarray(exam.organs)
+    if organ == "lung":
+        mask = np.isin(labels, LUNG_LABELS)
+    elif organ == "liver":
+        mask = np.isin(labels, liver_labels)
+    else:
+        return None
+    if not np.any(mask):
+        return None
+    return mask
+
+
+def _initial_affine(fixed_anatomy, moving_anatomy, fixed: Exam, moving: Exam, organ: str, liver_labels: tuple[int, ...]):
+    """Start the affine at the cancer organ. A missing organ keeps the volume center."""
+    fixed_mask = _cancer_organ_mask(fixed, organ, liver_labels)
+    moving_mask = _cancer_organ_mask(moving, organ, liver_labels)
+    if fixed_mask is not None and moving_mask is not None:
+        return sitk.CenteredTransformInitializer(
+            _sitk_image(fixed_mask.astype(np.uint8), fixed),
+            _sitk_image(moving_mask.astype(np.uint8), moving),
+            sitk.AffineTransform(3),
+            sitk.CenteredTransformInitializerFilter.MOMENTS,
+        )
+    return sitk.CenteredTransformInitializer(
+        fixed_anatomy, moving_anatomy, sitk.AffineTransform(3), sitk.CenteredTransformInitializerFilter.GEOMETRY,
+    )
+
+
+def _place_on_organ(moving: Exam, fixed: Exam, organ: str, liver_labels: tuple[int, ...]) -> Exam:
+    """Shift the moving volume so its cancer organ sits on the fixed one."""
+    fixed_mask = _cancer_organ_mask(fixed, organ, liver_labels)
+    moving_mask = _cancer_organ_mask(moving, organ, liver_labels)
+    if fixed_mask is None or moving_mask is None:
+        return moving
+    delta = np.asarray(_centroid_mm(fixed_mask, fixed)) - np.asarray(_centroid_mm(moving_mask, moving))
+    origin = tuple(float(value) for value in np.asarray(moving.origin_mm) + delta)
+    return replace(moving, origin_mm=origin)
+
+
 def _optimize_affine(fixed, moving, initial, iterations: int):
     method = sitk.ImageRegistrationMethod()
     method.SetMetricAsMeanSquares()
@@ -709,11 +901,11 @@ def _add_demons(fixed_anatomy, moving_anatomy, affine, iterations: int, anatomy_
         return affine
 
 
-def _ants_image(ants, array: np.ndarray, exam: Exam):
+def _ants_image(ants, array: np.ndarray, exam: Exam, origin: tuple[float, float, float] | None = None):
     # from_numpy treats axis 0 as x, while these volumes are stored z, y, x.
     image = ants.from_numpy(
         np.transpose(array, (2, 1, 0)),
-        origin=tuple(float(value) for value in exam.origin_mm),
+        origin=tuple(float(value) for value in (exam.origin_mm if origin is None else origin)),
         spacing=tuple(float(value) for value in exam.spacing_mm),
     )
     image.set_direction(np.asarray(exam.direction, dtype=float).reshape(3, 3))

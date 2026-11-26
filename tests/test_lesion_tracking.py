@@ -8,7 +8,8 @@ import SimpleITK as sitk
 from app.services.lesion_tracking import (
     DISPARUE, DIVISION, FUSION, FUSIONNEE, NOUVELLE, PROGRESSION, REPONSE, STABLE,
     Exam, LesionTrackingError, LesionView,
-    SimpleItkAnatomyRegistrar, assign_lesions, dice, extract_instances, load_exam, make_registrar, track, track_folder,
+    SimpleItkAnatomyRegistrar, _anatomy_image, _centroid_mm, _initial_affine, assign_lesions, dice, extract_instances,
+    hausdorff95_mm, load_exam, make_registrar, organ_agreement, track, track_folder,
 )
 
 
@@ -106,7 +107,7 @@ def test_tracking_reports_each_date_before_the_result_is_written():
     assert notes[1][1].startswith("Recalage de l’anatomie")
 
 
-def test_a_lesion_can_leave_and_come_back_with_the_same_number():
+def test_a_lesion_absent_from_the_previous_exam_receives_a_new_number():
     shape = (4, 4, 56)
     organs = _liver(shape)
     first = _box(shape, (1, 1, 4), (2, 2, 2))
@@ -121,8 +122,31 @@ def test_a_lesion_can_leave_and_come_back_with_the_same_number():
         _exam("t4", organs, grown),
     ]
     result = track(exams, registrar=_Identity(), min_voxels=4, dilation_mm=0)
-    assert [row.status for row in result.records if row.lesion_id == 1] == [NOUVELLE, STABLE, STABLE, DISPARUE, PROGRESSION]
-    assert set(np.unique(result.labels["t4"])) == {0, 1}
+    assert [row.status for row in result.records if row.lesion_id == 1] == [NOUVELLE, STABLE, STABLE, DISPARUE, DISPARUE]
+    assert set(np.unique(result.labels["t4"])) == {0, 2}
+
+
+def test_each_exam_is_compared_with_the_previous_one():
+    shape = (4, 4, 80)
+    organs = _liver(shape)
+    first = _box(shape, (1, 1, 4), (2, 2, 2))
+    second = _box(shape, (1, 1, 24), (2, 2, 2))
+    third = _box(shape, (1, 1, 44), (2, 2, 2))
+    seen = []
+
+    class _Record:
+        def warp_labels(self, fixed, moving, labels):
+            seen.append((moving.time_id, fixed.time_id))
+            return np.asarray(labels)
+
+    result = track([
+        _exam("t0", organs, first),
+        _exam("t1", organs, second),
+        _exam("t2", organs, third),
+    ], registrar=_Record(), min_voxels=4, dilation_mm=0)
+    assert seen == [("t1", "t0"), ("t2", "t1")]
+    assert [row.status for row in result.records if row.lesion_id == 1] == [NOUVELLE, STABLE, STABLE]
+    assert set(np.unique(result.labels["t2"])) == {0, 1}
 
 
 def test_couinaud_is_the_majority_segment_and_the_largest_lesion_is_first():
@@ -160,6 +184,99 @@ def test_folder_roundtrip_rejects_a_mask_on_another_grid(tmp_path):
     sitk.WriteImage(image, str(foreign), True)
     with pytest.raises(LesionTrackingError, match="grille"):
         load_exam(patient / "2000-06-01")
+
+
+def test_one_distant_voxel_does_not_set_the_hausdorff_95():
+    shape = (24, 24, 24)
+    left = np.zeros(shape, dtype=bool)
+    left[6:16, 6:16, 6:16] = True
+    right = left.copy()
+    right[6, 6, 22] = True
+    assert hausdorff95_mm(left, right, (1.0, 1.0, 1.0)) < 1.0
+    assert dice(left, right) > 0.9
+
+
+def test_a_shifted_liver_lowers_the_dice_and_raises_the_hausdorff():
+    shape = (20, 20, 20)
+    left = np.zeros(shape, np.int32)
+    right = np.zeros(shape, np.int32)
+    left[4:14, 4:14, 4:14] = 5
+    right[4:14, 4:14, 8:18] = 5
+    row = organ_agreement("t1", "t0", left, right, (1.0, 1.0, 1.0), "liver")
+    assert row.dice < 0.8
+    assert 3.0 <= row.hd95_mm <= 5.0
+    assert row.as_dict()["organ"] == "liver"
+
+
+def test_the_followup_stores_the_lung_overlap_of_each_later_exam():
+    shape = (12, 12, 12)
+    organs = np.zeros(shape, np.int32)
+    organs[2:10, 2:10, 2:10] = 10
+    lesion = _box(shape, (4, 4, 4), (3, 3, 3))
+
+    class _Reuse:
+        def warp_labels(self, fixed, moving, labels):
+            self.pair = (fixed, moving)
+            return np.asarray(labels)
+
+        def resample_with_last(self, fixed, moving, labels):
+            assert (fixed, moving) == self.pair
+            return np.asarray(labels)
+
+    result = track([
+        _exam("t0", organs, lesion),
+        _exam("t1", organs, lesion),
+    ], registrar=_Reuse(), min_voxels=4, dilation_mm=0, organ="lung")
+    assert [(item.time_id, item.fixed_time_id, item.organ, item.dice, item.hd95_mm) for item in result.alignments] == [
+        ("t1", "t0", "lung", 1.0, 0.0),
+    ]
+
+
+def test_registration_starts_on_the_cancer_organ_and_keeps_the_volume_center_without_it():
+    fixed_organs = np.zeros((12, 8, 8), np.int32)
+    moving_organs = np.zeros((36, 8, 8), np.int32)
+    fixed_organs[1:4] = 10
+    moving_organs[1:4] = 10
+    fixed = _exam("t0", fixed_organs, np.zeros_like(fixed_organs))
+    moving = _exam("t1", moving_organs, np.zeros_like(moving_organs))
+    fixed_anatomy = _anatomy_image(fixed, (5,))
+    moving_anatomy = _anatomy_image(moving, (5,))
+    fixed_lung = _centroid_mm(fixed_organs == 10, fixed)
+    moving_lung = _centroid_mm(moving_organs == 10, moving)
+    started = _initial_affine(fixed_anatomy, moving_anatomy, fixed, moving, "lung", (5,))
+    mapped = started.TransformPoint(fixed_lung)
+    assert np.linalg.norm(np.subtract(mapped, moving_lung)) < 1
+    volume = _initial_affine(fixed_anatomy, moving_anatomy, fixed, moving, "", (5,))
+    assert np.linalg.norm(np.subtract(volume.TransformPoint(fixed_lung), moving_lung)) > 5
+    liver = np.zeros((8, 8, 8), np.int32)
+    liver[2:5] = 5
+    head = _exam("head", liver, np.zeros_like(liver))
+    other = _exam("other", liver, np.zeros_like(liver))
+    head_anatomy = _anatomy_image(head, (5,))
+    other_anatomy = _anatomy_image(other, (5,))
+    missing = _initial_affine(head_anatomy, other_anatomy, head, other, "lung", (5,))
+    geometric = _initial_affine(head_anatomy, other_anatomy, head, other, "", (5,))
+    point = (1.0, 2.0, 3.0)
+    assert np.allclose(missing.TransformPoint(point), geometric.TransformPoint(point))
+
+    class _Recorded:
+        organ = ""
+
+        def warp_labels(self, fixed, moving, labels):
+            self.seen = self.organ
+            return np.zeros(fixed.ct.shape, np.uint16)
+
+        def resample_with_last(self, fixed, moving, labels):
+            return np.zeros(fixed.ct.shape, np.uint16)
+
+    nodule = np.zeros((12, 8, 8), np.int32)
+    nodule[1:4, 1:4, 1:4] = 1
+    registrar = _Recorded()
+    track([
+        _exam("t0", fixed_organs, nodule),
+        _exam("t1", fixed_organs, nodule),
+    ], registrar=registrar, organ="lung", min_voxels=4, dilation_mm=0)
+    assert registrar.seen == "lung"
 
 
 def test_registration_brings_a_shifted_liver_lesion_back():

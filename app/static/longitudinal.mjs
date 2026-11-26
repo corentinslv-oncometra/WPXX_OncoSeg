@@ -23,6 +23,15 @@ function escapeText(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[character]));
 }
 
+function alignmentText(alignment) {
+  if (!alignment || alignment.dice == null) return '';
+  const names = {lung: 'poumon', liver: 'foie', organs: 'organes'};
+  const organ = names[alignment.organ] || 'organes';
+  const dice = Number(alignment.dice).toFixed(2).replace('.', ',');
+  const distance = alignment.hd95_mm == null ? '—' : `${Number(alignment.hd95_mm).toFixed(1).replace('.', ',')} mm`;
+  return `Dice ${organ} ${dice} · HD95 ${distance}`;
+}
+
 export function createLongitudinal({view, inspector, windowing, loadVolume, loadLabels, onChange, onRenumber, onError}) {
   let active = false;
   let dates = [];
@@ -268,7 +277,8 @@ export function createLongitudinal({view, inspector, windowing, loadVolume, load
     for (const date of dates) {
       const panel = document.createElement('article');
       panel.className = 'long-panel';
-      panel.innerHTML = `<header><b>${escapeText(date.time_id)}</b><span class="long-slice">Chargement…</span></header><canvas aria-label="Coupe axiale ${escapeText(date.time_id)}"></canvas><input type="range" min="0" value="0" aria-label="Coupe de ${escapeText(date.time_id)}">`;
+      const fit = alignmentText(date.alignment);
+      panel.innerHTML = `<header><div class="long-title"><b>${escapeText(date.time_id)}</b>${fit ? `<span class="long-fit">${escapeText(fit)}</span>` : ''}</div><span class="long-slice">Chargement…</span></header><canvas aria-label="Coupe axiale ${escapeText(date.time_id)}"></canvas><input type="range" min="0" value="0" aria-label="Coupe de ${escapeText(date.time_id)}">`;
       date.node = panel;
       date.canvas = panel.querySelector('canvas');
       date.slider = panel.querySelector('input');

@@ -468,6 +468,23 @@ def test_patient_list_reports_whether_the_seg_is_present_and_used(clients):
     assert admin.get("/api/projects/lung-ct/local-catalog/patient", params={"path": "nav-set", "patient_id": "ABSENT"}).status_code == 422
 
 
+def test_catalog_scan_reports_each_patient(clients):
+    admin, _, _ = clients
+    root = Path(os.environ["APP_STORAGE_ROOT"]) / "scan-box"
+    _write_ct_series(root / "PAT1" / "2016-01-02-NA-aaa-11111" / "2-Portal-aaaa1", "P1", "1.2.3.4.5.9")
+    started = admin.post("/api/projects/lung-ct/local-catalog/scan", json={"path": "scan-box"})
+    assert started.status_code == 202, started.text
+    status = {}
+    for _ in range(100):
+        status = admin.get("/api/projects/lung-ct/local-catalog/scan", params={"path": "scan-box"}).json()
+        if status["state"] != "running":
+            break
+        time.sleep(0.05)
+    assert status["state"] == "done", status
+    assert status["percent"] == 100
+    assert status["catalog"]["patients"][0]["id"] == "PAT1"
+
+
 def test_local_folder_import_reads_dicom_inside_data(clients):
     admin, _, _ = clients
     root = Path(os.environ["APP_STORAGE_ROOT"])

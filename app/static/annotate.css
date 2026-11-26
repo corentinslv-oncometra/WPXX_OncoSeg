@@ -62,7 +62,9 @@ body.longitudinal-mode #follow-inspector{display:flex}
 .long-swatch{display:inline-block;width:10px;height:10px;border-radius:99px}
 #follow-chart{width:100%;height:150px;background:#10181c;border-radius:6px}
 .long-panel{display:flex;flex-direction:column;min-width:0;min-height:0;background:#050809;border-right:1px solid #1c2a30}
-.long-panel header{display:flex;justify-content:space-between;gap:8px;padding:8px 10px;color:#d5e2e4;font-size:12px}
+.long-panel header{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:8px 10px;color:#d5e2e4;font-size:12px}
+.long-title{display:flex;flex-direction:column;gap:2px;min-width:0}
+.long-fit{color:#9fd0c8;font-size:11px;line-height:1.3}
 .long-panel canvas{flex:1;min-height:0;width:100%;cursor:grab;touch-action:none}
 .long-panel canvas:active{cursor:grabbing}
 .long-panel input{margin:0 10px 10px}

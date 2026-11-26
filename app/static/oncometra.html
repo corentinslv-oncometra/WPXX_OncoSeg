@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Oncometra | Annotation</title>
-  <link rel="stylesheet" href="/assets/oncometra.css?v=cohorts-26">
-  <script type="module" src="/assets/oncometra.js?v=cohorts-35"></script>
+  <link rel="stylesheet" href="/assets/oncometra.css?v=cohorts-28">
+  <script type="module" src="/assets/oncometra.js?v=cohorts-38"></script>
 </head>
 <body>
   <section id="login-screen" class="login-screen" hidden>
@@ -37,6 +37,13 @@
     <div class="detection-actions"><button id="detection-cancel" type="button" hidden>Annuler</button></div>
     <p id="detection-dice" hidden></p>
     <p id="detection-error" class="error" hidden></p>
+  </dialog>
+  <dialog id="import-dialog">
+    <div class="modal-heading"><h2 id="import-progress-title">Import</h2><button id="import-progress-close" class="quiet" type="button">Fermer</button></div>
+    <p id="import-progress-detail">Lecture du dossier…</p>
+    <p id="import-progress-percent" class="detection-percent">0 %</p>
+    <div class="detection-track" aria-hidden="true"><span id="import-progress-bar"></span></div>
+    <p id="import-progress-error" class="error" hidden></p>
   </dialog>
   <dialog id="tracking-dialog">
     <div class="modal-heading"><h2 id="tracking-title">Suivi des lésions</h2><button id="tracking-close" class="quiet" type="button">Fermer</button></div>

@@ -107,7 +107,11 @@ dialog:has(.ds-detail){width:min(920px,calc(100vw - 30px))}
 .organs-table table{width:max-content;min-width:100%}
 .organs-table th,.organs-table td{white-space:nowrap;text-align:right}
 .organs-table th:first-child,.organs-table td:first-child{text-align:left}
-#detection-dialog{width:min(440px,calc(100vw - 30px))}
+#detection-dialog,#import-dialog{width:min(440px,calc(100vw - 30px))}
+#import-progress-detail{margin:0;line-height:1.5}
+#import-live{margin:0 0 16px;padding:16px;border:1px solid #8eb0e4;border-radius:8px;background:#f4f8ff}
+#import-live h3{margin:0 0 8px;font-size:1rem}
+#import-live[hidden]{display:none}
 #tracking-dialog{width:min(760px,calc(100vw - 30px))}
 #tracking-detail{margin:0;line-height:1.5}
 #assignment-track.active{background:#e7f0ff;border-color:#8eb0e4;color:#0a5ad4}

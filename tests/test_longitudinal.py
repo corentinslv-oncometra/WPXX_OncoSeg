@@ -1,10 +1,11 @@
+import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from app.services.lesion_followup import _rank_from_enhancement, select_followup_cases
+from app.services.lesion_followup import _rank_from_enhancement, followup_lesion_labels, select_followup_cases
 from app.services.longitudinal import (
     NumberSwapRequired, _missing_registration, commit_number_change, evolution_rows, lesion_centers,
     native_z_mm, registered_shift, slice_for_registered_z,
@@ -103,6 +104,73 @@ def test_the_series_that_carries_the_segmentation_wins_a_tie():
     assert omitted == ["2-PORTAL-2"]
 
 
+def test_lung_cancer_keeps_the_chest_and_a_whole_body_ct_when_that_is_all_there_is():
+    paths = [
+        "ACRIN/1960-01-10-Thorax/2-Chest 5.0 B30s-88591",
+        "ACRIN/1960-01-10-Thorax/3-Abdomen 5.0 B30s-06605",
+        "ACRIN/1960-01-10-Thorax/1-Topogram-40919",
+        "ACRIN/1960-01-24-Abdomen/2-CT WB 5.0 B30s-39560",
+        "ACRIN/1960-01-24-Abdomen/605-PET WB-60546",
+        "ACRIN/1960-01-24-Abdomen/606-PET WB-uncorrected-24597",
+        "ACRIN/1960-05-31-Abdomen/2-CT WB 5.0 B30s-19975",
+        "ACRIN/1960-05-31-Abdomen/605-PET WB-uncorrected-03662",
+        "ACRIN/1960-05-31-Abdomen/606-PET WB-54932",
+        "ACRIN/1960-08-30-Thorax/2-Chest W 5.0 B30s-15219",
+    ]
+    kept, omitted = select_followup_cases([_case(path) for path in paths], cancer="NSCLC")
+    assert [item.source["local_timepoint"] for item in kept] == [
+        paths[0], paths[3], paths[6], paths[9],
+    ]
+    assert omitted == [
+        "1-Topogram-40919",
+        "605-PET WB-60546",
+        "606-PET WB-uncorrected-24597",
+        "605-PET WB-uncorrected-03662",
+        "606-PET WB-54932",
+        "3-Abdomen 5.0 B30s-06605",
+    ]
+
+
+def test_a_dedicated_chest_outranks_a_whole_body_ct_for_lung_cancer():
+    kept, omitted = select_followup_cases([
+        _case("P/1960-01-24/9-CT WB 5.0 B30s-1"),
+        _case("P/1960-01-24/2-Chest 5.0 B30s-2"),
+    ], cancer="lung")
+    assert [item.source["local_timepoint"] for item in kept] == ["P/1960-01-24/2-Chest 5.0 B30s-2"]
+    assert omitted == ["9-CT WB 5.0 B30s-1"]
+
+
+def test_liver_cancer_keeps_the_portal_series_and_drops_a_chest():
+    kept, omitted = select_followup_cases([
+        _case("HCC_001/2000-04-21-CT/4-ABDOMEN-4"),
+        _case("HCC_001/2000-04-21-CT/3-CHEST-3"),
+        _case("HCC_001/2000-04-21-CT/1-ARTERIAL-1"),
+        _case("HCC_001/2000-04-21-CT/2-PORTAL VENOUS-2"),
+    ], cancer="HCC")
+    assert [item.source["local_timepoint"] for item in kept] == [
+        "HCC_001/2000-04-21-CT/2-PORTAL VENOUS-2",
+    ]
+    assert omitted == ["4-ABDOMEN-4", "3-CHEST-3", "1-ARTERIAL-1"]
+
+
+def test_a_mask_without_lung_does_not_count_as_covering_the_chest(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.services.lesion_followup.series_result_dir", lambda uid: tmp_path / uid)
+    chest = _case("P/1960-01-10/2-Chest 5.0 B30s-2")
+    chest.source["series_instance_uid"] = "chest"
+    abdomen = _case("P/1960-01-10/3-Abdomen 5.0 B30s-3")
+    abdomen.source["series_instance_uid"] = "abdomen"
+    for uid, names in (("chest", ["liver"]), ("abdomen", ["lung_upper_lobe_left"])):
+        folder = tmp_path / uid
+        folder.mkdir()
+        (folder / "hu.json").write_text(
+            json.dumps({"organs": [{"name": name} for name in names]}),
+            encoding="utf-8",
+        )
+    kept, omitted = select_followup_cases([chest, abdomen], cancer="NSCLC")
+    assert kept == [abdomen]
+    assert omitted == ["2-Chest 5.0 B30s-2"]
+
+
 def test_tracking_without_a_registered_position_must_be_recomputed():
     assert _missing_registration([{"volume_cm3": 6.1}])
     assert not _missing_registration([{"volume_cm3": 6.1, "registered_z_mm": -95.0}])
@@ -164,3 +232,13 @@ def test_an_unknown_number_is_refused(tmp_path):
     _tracking(tmp_path, np.zeros((1, 1, 1), np.uint16))
     with pytest.raises(Exception, match="n’est pas dans ce suivi"):
         commit_number_change(tmp_path, 9, 4, swap=False)
+
+
+def test_followup_keeps_the_nodules_and_drops_the_lung(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.lesion_followup.class_names",
+        lambda task: {1: "lung", 2: "lung_nodules"} if task == "lung_nodules" else {1: "liver_lesions"},
+    )
+    labels = np.array([0, 1, 2], np.int32)
+    assert followup_lesion_labels(labels, "Non-small Cell Lung Cancer").tolist() == [0, 0, 1]
+    assert followup_lesion_labels(np.array([0, 1], np.int32), "HCC").tolist() == [0, 1]
